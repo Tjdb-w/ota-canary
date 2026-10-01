@@ -342,11 +342,13 @@ def cmd_release_create(state, args):
     return release_view(state, release)
 
 
-def cmd_release_start(state, args):
-    release_id = require_id(args.release_id, "release-id")
-    release = get_release(state, release_id)
-    if release["status"] != "pending":
-        raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
+def compute_release_candidates(state, release):
+    """按 release start 的口径只读计算候选设备。
+
+    返回 (targetDeviceIds, eligible)：targetDeviceIds 为 None 表示未指定定向；
+    显式目标先校验全部存在（DeviceNotFound），再校验版本与占用（InvalidArgument）。
+    eligible 已按 device-id 升序（显式目标集合在 create 时已排序）。
+    """
     target_device_ids = release.get("targetDeviceIds")
     occupied = set()
     for other in state["releases"].values():
@@ -355,7 +357,6 @@ def cmd_release_start(state, args):
                 occupied.update(batch)
     if target_device_ids is not None:
         # 显式目标：先确认全部存在（DeviceNotFound），再确认版本与占用（InvalidArgument）。
-        # 全部校验通过前不修改发布状态、批次、报告、设备版本、心跳或占用关系。
         for device_id in target_device_ids:
             if device_id not in state["devices"]:
                 raise DeviceNotFound("target device not found: %s" % device_id)
@@ -371,19 +372,47 @@ def cmd_release_start(state, args):
                     "target device %s is occupied by another in_progress or paused release"
                     % device_id
                 )
-        eligible = list(target_device_ids)
-    else:
-        eligible = sorted(
-            device_id
-            for device_id, device in state["devices"].items()
-            if device.get("version") == release["previousVersion"] and device_id not in occupied
-        )
+        return target_device_ids, list(target_device_ids)
+    eligible = sorted(
+        device_id
+        for device_id, device in state["devices"].items()
+        if device.get("version") == release["previousVersion"] and device_id not in occupied
+    )
+    return target_device_ids, eligible
+
+
+def cmd_release_start(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "pending":
+        raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
+    # 全部校验通过前不修改发布状态、批次、报告、设备版本、心跳或占用关系。
+    _, eligible = compute_release_candidates(state, release)
     batch_size = release["batchSize"]
     release["batches"] = [eligible[i:i + batch_size] for i in range(0, len(eligible), batch_size)]
     release["currentBatch"] = 0
     release["reports"] = {}
     release["status"] = "in_progress" if release["batches"] else "completed"
     return release_view(state, release)
+
+
+def cmd_release_plan(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "pending":
+        raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
+    # 只读计算：不创建批次、reports，不改设备版本、心跳、占用关系或状态文件。
+    target_device_ids, eligible = compute_release_candidates(state, release)
+    batch_size = release["batchSize"]
+    batches = [eligible[i:i + batch_size] for i in range(0, len(eligible), batch_size)]
+    return {
+        "releaseId": release["releaseId"],
+        "targetDeviceIds": target_device_ids,
+        "eligibleDeviceIds": eligible,
+        "batchSize": batch_size,
+        "candidateCount": len(eligible),
+        "batches": batches,
+    }
 
 
 def cmd_device_report(state, args):
@@ -617,6 +646,11 @@ def build_parser():
     release_start.add_argument("--release-id", required=True)
     release_start.set_defaults(handler=cmd_release_start, mutating=True)
     add_state_option(release_start)
+
+    release_plan = release_sub.add_parser("plan", help="只读预览 pending 发布的分批计划")
+    release_plan.add_argument("--release-id", required=True)
+    release_plan.set_defaults(handler=cmd_release_plan, mutating=False)
+    add_state_option(release_plan)
 
     release_check = release_sub.add_parser("check", help="按给定时刻收批心跳超时设备")
     release_check.add_argument("--release-id", required=True)

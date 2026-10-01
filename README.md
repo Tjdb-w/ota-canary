@@ -28,6 +28,9 @@ python -m ota_canary release create --release-id R1 --version 2.0.0 \
     [--target-device-id d1 --target-device-id d2]
 python -m ota_canary release start --release-id R1
 
+# 只读预览 pending 发布的分批计划（不创建批次、reports，不改变任何状态）
+python -m ota_canary release plan --release-id R1
+
 # 当前批设备上报结果
 python -m ota_canary device report --release-id R1 --device-id d1 \
     --result success --heartbeat-at 2026-10-01T10:00:00Z
@@ -65,6 +68,19 @@ python -m ota_canary status --release-id R1
   `release_failure_threshold`，未回滚或旧状态原因不明时为 `null`。
 - 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中发布占用的设备，
   按 `device-id` 升序分批；空匹配的发布直接 `completed`。
+- `release plan --release-id <id>` 是 pending 发布的只读分批预览，沿用 `--state`、
+  `release create` 的目标集合与 `release start` 的候选/分批语义（同一套计算），但
+  不创建批次、reports，不改设备版本、心跳、占用关系或状态文件，重复调用结果稳定。
+  成功输出字段固定为 `releaseId`、`targetDeviceIds`、`eligibleDeviceIds`、`batchSize`、
+  `candidateCount`、`batches`：`targetDeviceIds` 显式定向时按 device-id 升序返回目标
+  集合，否则为 `null`；`eligibleDeviceIds` 升序仅含当前版本等于 `previousVersion` 且
+  未被 `in_progress`/`paused` 发布占用的设备；`candidateCount` 为其数量；`batches`
+  按 `batchSize` 切分，空候选为 `[]`。显式目标任一不存在返回 `DeviceNotFound`；其余
+  目标版本不等于 `previousVersion` 或被其他进行中/暂停发布占用返回 `InvalidArgument`，
+  且成功校验前不输出计划；存在性先于版本与占用校验。显式目标为空列表时
+  `eligibleDeviceIds` 与 `batches` 均为空。发布不存在返回 `DeviceNotFound`；对非
+  `pending` 发布执行返回 `InvalidState`。错误走 stderr JSON 且退出码非零；`status`
+  保持现有输出，旧状态缺少 `targetDeviceIds` 时该字段为 `null`（视为未指定）。
 - `release create` 可选、可重复的 `--target-device-id` 用于定向灰度：显式指定后，本次
   发布只升级给定设备，`release start` 不再自动吸收全部符合版本条件的设备。该参数可放在
   子命令前后并混用，多次出现按出现顺序合并。取值修剪后为空返回 `InvalidArgument`；
@@ -126,7 +142,7 @@ python -m ota_canary status --release-id R1
   `abortedAt`，旧状态缺少这两个字段时显示 `null`，不补写历史；`manual_abort`
   不改变 `batch_failure_threshold` 与 `release_failure_threshold` 的既有口径。
 - 已超时设备或非当前批设备的迟到 `device report` 返回 `InvalidArgument`。
-- 成功的命令输出 JSON 并持久化状态；`status` 为只读，不产生业务变化。
+- 成功的写命令输出 JSON 并持久化状态；`status` 与 `release plan` 为只读，不产生业务变化。
 - 失败命令以非零退出码结束，向 stderr 输出 JSON 错误，且不修改状态文件。
   错误码：`DeviceNotFound`（设备或发布不存在）、`DeviceExists`（重复登记或重复发布）、
   `InvalidArgument`（参数非法、重复、非当前批或已超时报告、非法 `at`/`heartbeat-timeout-seconds`/`stabilization-seconds`/`max-release-failure-percent`、
