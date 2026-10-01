@@ -24,7 +24,8 @@ python -m ota_canary device heartbeat --device-id d1 --version 1.0.0 --heartbeat
 python -m ota_canary release create --release-id R1 --version 2.0.0 \
     --previous-version 1.0.0 --batch-size 2 --max-failure-percent 50 \
     [--max-release-failure-percent 30] \
-    [--heartbeat-timeout-seconds 900] [--stabilization-seconds 0]
+    [--heartbeat-timeout-seconds 900] [--stabilization-seconds 0] \
+    [--target-device-id d1 ...]
 python -m ota_canary release start --release-id R1
 
 # 当前批设备上报结果
@@ -62,8 +63,21 @@ python -m ota_canary status --release-id R1
   结果数（含显式上报与超时补写结果），`failedCount` 为其中 `result=failure` 的数量；
   `stopReason` 在逐批回滚时为 `batch_failure_threshold`、累计回滚时为
   `release_failure_threshold`，未回滚或旧状态原因不明时为 `null`。
-- 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中发布占用的设备，
+- 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中/暂停发布占用的设备，
   按 `device-id` 升序分批；空匹配的发布直接 `completed`。
+- 定向灰度：`release create` 可重复提供 `--target-device-id` 显式指定本次只升级的设备。
+  该参数可放在子命令前后，与 `--state` 一样。值去除首尾空白后为空、或同一 device-id
+  重复给出均返回 `InvalidArgument`，不创建发布。发布视图含 `targetDeviceIds`：显式指定时
+  按 `device-id` 升序返回目标集合；未指定以及旧状态缺少该字段时为 `null`，旧状态继续
+  采用原有全量选择行为，不重写历史记录。
+- `release start` 对显式目标集合逐个校验：目标设备不存在返回 `DeviceNotFound`；
+  目标设备存在但其版本不等于 `previousVersion`、或正被其他 `in_progress`/`paused`
+  发布占用时返回 `InvalidArgument`。任一目标不合法都不修改发布状态、批次、报告、
+  设备版本、心跳或占用关系。所有目标均合法时只在目标集合中选择（目标集合创建时已排序，
+  仍按 `device-id` 升序分批）；显式目标集合为空时发布直接进入 `completed`，与当前
+  空匹配结果一致。定向发布启动后，`device report`、`release check` 超时判定、
+  逐批失败率、可选发布级累计失败率、`stabilization-seconds` 观察推进、`pause`、
+  `resume`、`abort`、`status` 的既有字段与结果语义保持不变。
 - `release check --at <时刻>` 仅处理 `in_progress` 发布：对当前批尚未显式上报结果的设备，
   将其 `heartbeatAt` 与 `at` 换算为 UTC 瞬间，当 `at` 严格晚于 `heartbeatAt + 超时秒数` 时，
   写入 `result=failure`、`reason=timeout`，`heartbeatAt` 保留设备原值；已有显式结果不覆盖。
@@ -109,9 +123,9 @@ python -m ota_canary status --release-id R1
 - 已超时设备或非当前批设备的迟到 `device report` 返回 `InvalidArgument`。
 - 成功的命令输出 JSON 并持久化状态；`status` 为只读，不产生业务变化。
 - 失败命令以非零退出码结束，向 stderr 输出 JSON 错误，且不修改状态文件。
-  错误码：`DeviceNotFound`（设备或发布不存在）、`DeviceExists`（重复登记或重复发布）、
+  错误码：`DeviceNotFound`（设备或发布不存在；`release start` 时目标设备不存在）、`DeviceExists`（重复登记或重复发布）、
   `InvalidArgument`（参数非法、重复、非当前批或已超时报告、非法 `at`/`heartbeat-timeout-seconds`/`stabilization-seconds`/`max-release-failure-percent`、
-  非法 `abort` 原因）、
+  非法 `abort` 原因、`--target-device-id` 空值或重复、`release start` 时目标设备版本不符或被占用）、
   `InvalidState`（对 pending/completed/rolled_back 发布执行 check，或推进非进行中发布；
   对非 in_progress 发布 pause、对非 paused 发布 resume；暂停期间对 paused 发布执行
   `device report` 或 `release check`；对非 in_progress/paused 发布执行 `abort`）。
