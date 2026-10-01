@@ -342,11 +342,13 @@ def cmd_release_create(state, args):
     return release_view(state, release)
 
 
-def cmd_release_start(state, args):
-    release_id = require_id(args.release_id, "release-id")
-    release = get_release(state, release_id)
-    if release["status"] != "pending":
-        raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
+def compute_release_plan(state, release):
+    """按 release start 的口径只读计算候选设备与分批。
+
+    显式目标先做存在性校验（DeviceNotFound），再做版本与占用校验
+    （InvalidArgument）；未指定目标则吸收全部 currentVersion 等于
+    previousVersion 且未被 in_progress/paused 发布占用的设备。不修改状态。
+    """
     target_device_ids = release.get("targetDeviceIds")
     occupied = set()
     for other in state["releases"].values():
@@ -355,7 +357,6 @@ def cmd_release_start(state, args):
                 occupied.update(batch)
     if target_device_ids is not None:
         # 显式目标：先确认全部存在（DeviceNotFound），再确认版本与占用（InvalidArgument）。
-        # 全部校验通过前不修改发布状态、批次、报告、设备版本、心跳或占用关系。
         for device_id in target_device_ids:
             if device_id not in state["devices"]:
                 raise DeviceNotFound("target device not found: %s" % device_id)
@@ -379,10 +380,37 @@ def cmd_release_start(state, args):
             if device.get("version") == release["previousVersion"] and device_id not in occupied
         )
     batch_size = release["batchSize"]
-    release["batches"] = [eligible[i:i + batch_size] for i in range(0, len(eligible), batch_size)]
+    batches = [eligible[i:i + batch_size] for i in range(0, len(eligible), batch_size)]
+    return eligible, batches
+
+
+def cmd_release_plan(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "pending":
+        raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
+    eligible, batches = compute_release_plan(state, release)
+    return {
+        "releaseId": release["releaseId"],
+        "targetDeviceIds": release.get("targetDeviceIds"),
+        "eligibleDeviceIds": eligible,
+        "batchSize": release["batchSize"],
+        "candidateCount": len(eligible),
+        "batches": batches,
+    }
+
+
+def cmd_release_start(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "pending":
+        raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
+    eligible, batches = compute_release_plan(state, release)
+    # 全部校验通过后才落修改：批次、报告与状态。
+    release["batches"] = batches
     release["currentBatch"] = 0
     release["reports"] = {}
-    release["status"] = "in_progress" if release["batches"] else "completed"
+    release["status"] = "in_progress" if batches else "completed"
     return release_view(state, release)
 
 
@@ -612,6 +640,11 @@ def build_parser():
                                      "均须版本等于 previous-version 且未被进行中/暂停发布占用")
     release_create.set_defaults(handler=cmd_release_create, mutating=True)
     add_state_option(release_create)
+
+    release_plan = release_sub.add_parser("plan", help="只读预览 pending 发布的候选设备与分批")
+    release_plan.add_argument("--release-id", required=True)
+    release_plan.set_defaults(handler=cmd_release_plan, mutating=False)
+    add_state_option(release_plan)
 
     release_start = release_sub.add_parser("start", help="启动发布")
     release_start.add_argument("--release-id", required=True)

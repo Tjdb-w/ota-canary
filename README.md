@@ -28,6 +28,9 @@ python -m ota_canary release create --release-id R1 --version 2.0.0 \
     [--target-device-id d1 --target-device-id d2]
 python -m ota_canary release start --release-id R1
 
+# 只读预览 pending 发布的候选设备与分批（不创建批次、报告，不改任何状态）
+python -m ota_canary release plan --release-id R1
+
 # 当前批设备上报结果
 python -m ota_canary device report --release-id R1 --device-id d1 \
     --result success --heartbeat-at 2026-10-01T10:00:00Z
@@ -79,6 +82,18 @@ python -m ota_canary status --release-id R1
   （发布仍为 `pending`、`batches` 为空）。非空目标集合要求全部合法，因此校验通过即有
   成员；当目标集合为空（如状态中记录为空列表，目标合法性空真）时，发布直接 `completed`，
   与全量选择下的空匹配结果一致。
+- `release plan --release-id <id>` 为只读命令，预览 `pending` 发布按当前状态启动时的
+  候选设备与分批，沿用 `release create` 记录的目标集合与 `release start` 的选择、分批
+  语义（含 `in_progress`/`paused` 占用排除与 device-id 升序）。成功时输出 JSON，字段固定
+  为 `releaseId`、`targetDeviceIds`、`eligibleDeviceIds`、`batchSize`、`candidateCount`、
+  `batches`：`targetDeviceIds` 显式定向时按 device-id 升序返回目标集合，未指定为 `null`；
+  `eligibleDeviceIds` 按 device-id 升序，仅含 `currentVersion == previousVersion` 且未被
+  进行中/暂停发布占用的设备；`candidateCount` 为候选数量；`batches` 按 `batchSize` 切分，
+  空候选为 `[]`。显式目标任一不存在返回 `DeviceNotFound`；其余目标版本不符或被占用返回
+  `InvalidArgument`，均不输出计划；显式目标为空集合时 `eligibleDeviceIds` 与 `batches` 均
+  为空。发布不存在返回 `DeviceNotFound`；非 `pending` 返回 `InvalidState`。该命令只做只读
+  计算：不创建批次或 reports，不改设备版本、心跳、占用关系或状态文件，重复调用结果稳定。
+  同一候选与分批计算逻辑与 `release start` 共用，保证预览与实际启动一致。
 - 定向发布启动后，`device report`、`release check` 的超时判定、逐批失败率、可选的发布级
   累计失败率、`stabilization-seconds` 观察推进、`pause`/`resume`/`abort`、`status` 的
   既有字段与结果语义保持不变；迟到报告、设备占用解除、非零退出码、stderr JSON 错误以及
