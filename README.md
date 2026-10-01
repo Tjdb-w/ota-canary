@@ -10,6 +10,41 @@
 
 初始基线：只有本说明，尚无实现。
 
+## 用法
+
+仅依赖 Python 3 标准库，通过 `python -m ota_canary` 调用。默认读写当前目录下的
+`ota-canary-state.json`，可用 `--state <路径>` 指定其他状态文件（放在子命令前后均可）。
+
+```bash
+# 登记设备 / 更新心跳
+python -m ota_canary device add --device-id d1 --version 1.0.0 --heartbeat-at 2026-10-01T08:00:00Z
+python -m ota_canary device heartbeat --device-id d1 --version 1.0.0 --heartbeat-at 2026-10-01T09:00:00Z
+
+# 建立并启动发布
+python -m ota_canary release create --release-id R1 --version 2.0.0 \
+    --previous-version 1.0.0 --batch-size 2 --max-failure-percent 50
+python -m ota_canary release start --release-id R1
+
+# 当前批设备上报结果
+python -m ota_canary device report --release-id R1 --device-id d1 \
+    --result success --heartbeat-at 2026-10-01T10:00:00Z
+
+# 查看发布状态
+python -m ota_canary status --release-id R1
+```
+
+行为约定：
+
+- 版本号格式为 `MAJOR.MINOR.PATCH`，时间为 ISO 8601（支持 `Z` 后缀）。
+- 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中发布占用的设备，
+  按 `device-id` 升序分批；空匹配的发布直接 `completed`。
+- 整批到齐后，若 `failed * 100 > 设备数 * max-failure-percent`，发布变为 `rolled_back`，
+  涉及设备回到 `previousVersion` 且不再下发；否则进入下一批，全部完成时变为 `completed`。
+- 成功的命令输出 JSON 并持久化状态；`status` 为只读，不产生业务变化。
+- 失败命令以非零退出码结束，向 stderr 输出 JSON 错误，且不修改状态文件。
+  错误码：`DeviceNotFound`（设备或发布不存在）、`DeviceExists`（重复登记或重复发布）、
+  `InvalidArgument`（参数非法、重复或非当前批报告）、`InvalidState`（推进非进行中发布）。
+
 ## 约定
 
 - 公开行为以 README 与源码为准。
