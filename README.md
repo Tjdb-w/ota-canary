@@ -23,6 +23,7 @@ python -m ota_canary device heartbeat --device-id d1 --version 1.0.0 --heartbeat
 # 建立并启动发布
 python -m ota_canary release create --release-id R1 --version 2.0.0 \
     --previous-version 1.0.0 --batch-size 2 --max-failure-percent 50 \
+    [--max-release-failure-percent 30] \
     [--heartbeat-timeout-seconds 900] [--stabilization-seconds 0]
 python -m ota_canary release start --release-id R1
 
@@ -49,6 +50,14 @@ python -m ota_canary status --release-id R1
 - `release create` 可选 `--stabilization-seconds`，为大于等于 0 的整数，缺省 `0`；
   非整数或负数返回 `InvalidArgument`。发布视图含 `stabilizationSeconds` 与
   `stabilizationDeadline`；缺少这两个字段的旧发布分别按 `0` 与 `null` 计。
+- `release create` 可选 `--max-release-failure-percent`，仅接受 `0` 到 `100` 的整数，
+  非整数、负数或大于 `100` 返回 `InvalidArgument`；缺省（未提供）只判逐批失败率，
+  提供后启用发布级累计失败预算。发布视图含 `maxReleaseFailurePercent`，
+  未配置或旧状态缺该字段时为 `null`。
+- 发布视图含 `reportedCount`、`failedCount` 与 `stopReason`：`reportedCount` 为已有
+  结果数（含显式上报与超时补写结果），`failedCount` 为其中 `result=failure` 的数量；
+  `stopReason` 在逐批回滚时为 `batch_failure_threshold`、累计回滚时为
+  `release_failure_threshold`，未回滚或旧状态原因不明时为 `null`。
 - 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中发布占用的设备，
   按 `device-id` 升序分批；空匹配的发布直接 `completed`。
 - `release check --at <时刻>` 仅处理 `in_progress` 发布：对当前批尚未显式上报结果的设备，
@@ -56,8 +65,13 @@ python -m ota_canary status --release-id R1
   写入 `result=failure`、`reason=timeout`，`heartbeatAt` 保留设备原值；已有显式结果不覆盖。
   返回视图在顶层新增 `expiredDevices`，按 device-id 升序列出本次超时设备（无成员时为 `[]`）。
 - 整批仍缺结果时保持 `in_progress`，`pendingDevices` 只含未上报且未过期的当前批设备；
-  整批集齐后按 `failed * 100 > 设备数 * max-failure-percent` 判断，超过则 `rolled_back`，
-  否则推进下一批或 `completed`。
+  整批集齐后先按 `failed * 100 > 设备数 * max-failure-percent` 判断当前批，
+  超过则 `rolled_back`，`stopReason` 为 `batch_failure_threshold`；未超过再判全程
+  （仅当配置了 `--max-release-failure-percent`）：当
+  `failedCount * 100 > reportedCount * max-release-failure-percent` 时立即
+  `rolled_back`，`stopReason` 为 `release_failure_threshold`；两者均未触发才推进
+  下一批或 `completed`。累计回滚沿用逐批回滚口径：已纳入批次的设备恢复
+  `previousVersion`，拒绝迟到报告，并随发布终止解除设备占用。
 - 批次稳定观察：`stabilizationSeconds > 0` 时，整批集齐且失败率未超阈值不立即推进，
   保持 `in_progress` 与 `currentBatch`，`pendingDevices` 为 `[]`，并记录
   `stabilizationDeadline`（当前批报告中最晚 `heartbeatAt` 的 UTC 瞬间加观察秒数，
@@ -81,7 +95,7 @@ python -m ota_canary status --release-id R1
 - 成功的命令输出 JSON 并持久化状态；`status` 为只读，不产生业务变化。
 - 失败命令以非零退出码结束，向 stderr 输出 JSON 错误，且不修改状态文件。
   错误码：`DeviceNotFound`（设备或发布不存在）、`DeviceExists`（重复登记或重复发布）、
-  `InvalidArgument`（参数非法、重复、非当前批或已超时报告、非法 `at`/`heartbeat-timeout-seconds`/`stabilization-seconds`）、
+  `InvalidArgument`（参数非法、重复、非当前批或已超时报告、非法 `at`/`heartbeat-timeout-seconds`/`stabilization-seconds`/`max-release-failure-percent`）、
   `InvalidState`（对 pending/completed/rolled_back 发布执行 check，或推进非进行中发布；
   对非 in_progress 发布 pause、对非 paused 发布 resume；暂停期间对 paused 发布执行
   `device report` 或 `release check`）。
