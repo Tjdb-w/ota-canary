@@ -12,9 +12,10 @@ import os
 import re
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 DEFAULT_STATE_FILE = "ota-canary-state.json"
+DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 900
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 VALID_RESULTS = ("success", "failure")
@@ -76,6 +77,16 @@ def require_time(value):
     return value
 
 
+def parse_instant(value):
+    """把 ISO 8601 时间换算为 UTC 瞬间；无偏移量时按 UTC 处理。"""
+    text = value.strip()
+    candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    moment = datetime.fromisoformat(candidate)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
 def require_int(value, name):
     try:
         return int(str(value).strip())
@@ -95,6 +106,13 @@ def require_max_failure_percent(value):
     if percent < 0 or percent > 100:
         raise InvalidArgument("max-failure-percent must be between 0 and 100: %r" % (value,))
     return percent
+
+
+def require_heartbeat_timeout(value):
+    seconds = require_int(value, "heartbeat-timeout-seconds")
+    if seconds < 1:
+        raise InvalidArgument("heartbeat-timeout-seconds must be >= 1: %r" % (value,))
+    return seconds
 
 
 def require_result(value):
@@ -169,6 +187,8 @@ def release_view(state, release):
         "previousVersion": release["previousVersion"],
         "batchSize": release["batchSize"],
         "maxFailurePercent": release["maxFailurePercent"],
+        "heartbeatTimeoutSeconds": release.get(
+            "heartbeatTimeoutSeconds", DEFAULT_HEARTBEAT_TIMEOUT_SECONDS),
         "status": release["status"],
         "currentBatch": current,
         "batchCount": len(batches),
@@ -223,6 +243,7 @@ def cmd_release_create(state, args):
     previous_version = require_version(args.previous_version)
     batch_size = require_batch_size(args.batch_size)
     max_failure_percent = require_max_failure_percent(args.max_failure_percent)
+    heartbeat_timeout = require_heartbeat_timeout(args.heartbeat_timeout_seconds)
     if release_id in state["releases"]:
         raise DeviceExists("release already exists: %s" % release_id)
     release = {
@@ -231,6 +252,7 @@ def cmd_release_create(state, args):
         "previousVersion": previous_version,
         "batchSize": batch_size,
         "maxFailurePercent": max_failure_percent,
+        "heartbeatTimeoutSeconds": heartbeat_timeout,
         "status": "pending",
         "batches": [],
         "currentBatch": 0,
@@ -308,6 +330,37 @@ def advance_if_batch_complete(state, release):
         release["currentBatch"] = current + 1
 
 
+def cmd_release_check(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    at_value = require_time(args.at)
+    release = get_release(state, release_id)
+    if release["status"] != "in_progress":
+        raise InvalidState("release %s is not in progress (status: %s)" % (release_id, release["status"]))
+    at = parse_instant(at_value)
+    timeout = release.get("heartbeatTimeoutSeconds", DEFAULT_HEARTBEAT_TIMEOUT_SECONDS)
+    current_batch = release["batches"][release["currentBatch"]]
+    expired = []
+    for device_id in current_batch:
+        if device_id in release["reports"]:
+            continue
+        device = state["devices"].get(device_id, {})
+        heartbeat_at = device.get("heartbeatAt")
+        if heartbeat_at is None:
+            continue
+        deadline = parse_instant(heartbeat_at) + timedelta(seconds=timeout)
+        if at > deadline:
+            release["reports"][device_id] = {
+                "result": "failure",
+                "reason": "timeout",
+                "heartbeatAt": heartbeat_at,
+            }
+            expired.append(device_id)
+    advance_if_batch_complete(state, release)
+    view = release_view(state, release)
+    view["expiredDevices"] = sorted(expired)
+    return view
+
+
 def cmd_status(state, args):
     release_id = require_id(args.release_id, "release-id")
     release = get_release(state, release_id)
@@ -366,6 +419,9 @@ def build_parser():
     release_create.add_argument("--previous-version", required=True)
     release_create.add_argument("--batch-size", required=True)
     release_create.add_argument("--max-failure-percent", required=True)
+    release_create.add_argument("--heartbeat-timeout-seconds",
+                                default=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+                                help="心跳超时秒数（默认 %(default)s）")
     release_create.set_defaults(handler=cmd_release_create, mutating=True)
     add_state_option(release_create)
 
@@ -373,6 +429,12 @@ def build_parser():
     release_start.add_argument("--release-id", required=True)
     release_start.set_defaults(handler=cmd_release_start, mutating=True)
     add_state_option(release_start)
+
+    release_check = release_sub.add_parser("check", help="心跳超时收批")
+    release_check.add_argument("--release-id", required=True)
+    release_check.add_argument("--at", required=True)
+    release_check.set_defaults(handler=cmd_release_check, mutating=True)
+    add_state_option(release_check)
 
     status = subparsers.add_parser("status", help="查看发布状态")
     status.add_argument("--release-id", required=True)
