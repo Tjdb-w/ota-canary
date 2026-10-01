@@ -270,7 +270,7 @@ def cmd_release_start(state, args):
         raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
     occupied = set()
     for other in state["releases"].values():
-        if other["status"] == "in_progress":
+        if other["status"] in ("in_progress", "paused"):
             for batch in other["batches"]:
                 occupied.update(batch)
     eligible = sorted(
@@ -345,6 +345,24 @@ def cmd_release_check(state, args):
     view = release_view(state, release)
     view["expiredDevices"] = expired
     return view
+
+
+def cmd_release_pause(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "in_progress":
+        raise InvalidState("release %s is not in progress (status: %s)" % (release_id, release["status"]))
+    release["status"] = "paused"
+    return release_view(state, release)
+
+
+def cmd_release_resume(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "paused":
+        raise InvalidState("release %s is not paused (status: %s)" % (release_id, release["status"]))
+    release["status"] = "in_progress"
+    return release_view(state, release)
 
 
 def advance_if_batch_complete(state, release):
@@ -442,6 +460,16 @@ def build_parser():
     release_check.add_argument("--at", required=True, help="判定时刻（ISO 8601）")
     release_check.set_defaults(handler=cmd_release_check, mutating=True)
     add_state_option(release_check)
+
+    release_pause = release_sub.add_parser("pause", help="暂停进行中的发布")
+    release_pause.add_argument("--release-id", required=True)
+    release_pause.set_defaults(handler=cmd_release_pause, mutating=True)
+    add_state_option(release_pause)
+
+    release_resume = release_sub.add_parser("resume", help="恢复已暂停的发布")
+    release_resume.add_argument("--release-id", required=True)
+    release_resume.set_defaults(handler=cmd_release_resume, mutating=True)
+    add_state_option(release_resume)
 
     status = subparsers.add_parser("status", help="查看发布状态")
     status.add_argument("--release-id", required=True)

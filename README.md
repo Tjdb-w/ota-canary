@@ -33,6 +33,10 @@ python -m ota_canary device report --release-id R1 --device-id d1 \
 # 按给定时刻收批心跳超时设备（仅处理 in_progress 发布）
 python -m ota_canary release check --release-id R1 --at 2026-10-01T10:00:00Z
 
+# 暂停 / 恢复发布
+python -m ota_canary release pause --release-id R1
+python -m ota_canary release resume --release-id R1
+
 # 查看发布状态
 python -m ota_canary status --release-id R1
 ```
@@ -52,12 +56,24 @@ python -m ota_canary status --release-id R1
   整批集齐后按 `failed * 100 > 设备数 * max-failure-percent` 判断，超过则 `rolled_back`，
   否则推进下一批或 `completed`。
 - `status` 保持只读，不补写超时结果，但 `devices[].report` 可读出 `reason=timeout`。
+- `release pause` 仅对 `in_progress` 发布生效：状态改为 `paused`，原样保留
+  `batches`、`currentBatch`、`reports`、设备版本与心跳。`release resume` 仅对
+  `paused` 发布生效：恢复为 `in_progress`，从同一批次继续，不重建批次或报告。
+  暂停期间 `device report` 与 `release check` 对该发布返回 `InvalidState`，
+  不写报告、不推进批次、不改变设备；`status` 仍可只读查看，`device add` 与
+  `device heartbeat` 按既有规则工作。对 `pending`/`completed`/`rolled_back`
+  发布执行 pause，或对非 `paused` 发布执行 resume，均返回 `InvalidState`；
+  发布不存在返回 `DeviceNotFound`。
+- 其他发布选择设备时尊重暂停中的发布：`paused` 发布已占用的设备不会被新的
+  `release start` 纳入候选；设备占用在发布进入 `completed` 或 `rolled_back` 后解除。
 - 已超时设备或非当前批设备的迟到 `device report` 返回 `InvalidArgument`。
 - 成功的命令输出 JSON 并持久化状态；`status` 为只读，不产生业务变化。
 - 失败命令以非零退出码结束，向 stderr 输出 JSON 错误，且不修改状态文件。
   错误码：`DeviceNotFound`（设备或发布不存在）、`DeviceExists`（重复登记或重复发布）、
   `InvalidArgument`（参数非法、重复、非当前批或已超时报告、非法 `at`/`heartbeat-timeout-seconds`）、
-  `InvalidState`（对 pending/completed/rolled_back 发布执行 check，或推进非进行中发布）。
+  `InvalidState`（对 pending/completed/rolled_back 发布执行 check，或推进非进行中发布；
+  对非 in_progress 发布 pause、对非 paused 发布 resume；暂停期间对 paused 发布执行
+  `device report` 或 `release check`）。
 
 ## 约定
 
