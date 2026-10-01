@@ -136,6 +136,22 @@ def require_stabilization_seconds(value):
     return seconds
 
 
+def require_target_device_ids(values):
+    """校验可重复的 --target-device-id：未提供返回 None；空值或重复返回 InvalidArgument。"""
+    if values is None:
+        return None
+    seen = set()
+    target_ids = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidArgument("target-device-id must be a non-empty string: %r" % (value,))
+        if value in seen:
+            raise InvalidArgument("duplicate target-device-id: %s" % value)
+        seen.add(value)
+        target_ids.append(value)
+    return sorted(target_ids)
+
+
 def require_result(value):
     if value not in VALID_RESULTS:
         raise InvalidArgument("result must be one of %s: %r" % ("/".join(VALID_RESULTS), value))
@@ -233,6 +249,7 @@ def release_view(state, release):
         ),
         "stabilizationSeconds": release.get("stabilizationSeconds", 0),
         "stabilizationDeadline": release.get("stabilizationDeadline"),
+        "targetDeviceIds": release.get("targetDeviceIds"),
         "status": release["status"],
         "stopReason": release.get("stopReason"),
         "abortReason": release.get("abortReason"),
@@ -299,6 +316,7 @@ def cmd_release_create(state, args):
         args.heartbeat_timeout_seconds
     )
     stabilization_seconds = require_stabilization_seconds(args.stabilization_seconds)
+    target_device_ids = require_target_device_ids(args.target_device_id)
     if release_id in state["releases"]:
         raise DeviceExists("release already exists: %s" % release_id)
     release = {
@@ -311,6 +329,7 @@ def cmd_release_create(state, args):
         "heartbeatTimeoutSeconds": heartbeat_timeout_seconds,
         "stabilizationSeconds": stabilization_seconds,
         "stabilizationDeadline": None,
+        "targetDeviceIds": target_device_ids,
         "status": "pending",
         "stopReason": None,
         "abortReason": None,
@@ -328,16 +347,37 @@ def cmd_release_start(state, args):
     release = get_release(state, release_id)
     if release["status"] != "pending":
         raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
+    target_device_ids = release.get("targetDeviceIds")
     occupied = set()
     for other in state["releases"].values():
         if other["status"] in ("in_progress", "paused"):
             for batch in other["batches"]:
                 occupied.update(batch)
-    eligible = sorted(
-        device_id
-        for device_id, device in state["devices"].items()
-        if device.get("version") == release["previousVersion"] and device_id not in occupied
-    )
+    if target_device_ids is not None:
+        # 显式目标：先确认全部存在（DeviceNotFound），再确认版本与占用（InvalidArgument）。
+        # 全部校验通过前不修改发布状态、批次、报告、设备版本、心跳或占用关系。
+        for device_id in target_device_ids:
+            if device_id not in state["devices"]:
+                raise DeviceNotFound("target device not found: %s" % device_id)
+        for device_id in target_device_ids:
+            device = state["devices"][device_id]
+            if device.get("version") != release["previousVersion"]:
+                raise InvalidArgument(
+                    "target device %s version %r does not match previousVersion %r"
+                    % (device_id, device.get("version"), release["previousVersion"])
+                )
+            if device_id in occupied:
+                raise InvalidArgument(
+                    "target device %s is occupied by another in_progress or paused release"
+                    % device_id
+                )
+        eligible = list(target_device_ids)
+    else:
+        eligible = sorted(
+            device_id
+            for device_id, device in state["devices"].items()
+            if device.get("version") == release["previousVersion"] and device_id not in occupied
+        )
     batch_size = release["batchSize"]
     release["batches"] = [eligible[i:i + batch_size] for i in range(0, len(eligible), batch_size)]
     release["currentBatch"] = 0
@@ -514,6 +554,9 @@ def build_parser():
     )
     parser.add_argument("--state", default=DEFAULT_STATE_FILE,
                         help="状态文件路径（默认 %(default)s）")
+    parser.add_argument("--target-device-id", dest="target_device_id_pre",
+                        action="append", default=None, metavar="DEVICE_ID",
+                        help="定向发布目标设备，可重复；仅对 release create 生效")
     subparsers = parser.add_subparsers(dest="command")
 
     def add_state_option(sub):
@@ -563,6 +606,10 @@ def build_parser():
                                 help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
     release_create.add_argument("--stabilization-seconds", default=0,
                                 help="批次稳定观察秒数，>=0 的整数（默认 %(default)s）")
+    release_create.add_argument("--target-device-id", action="append",
+                                default=argparse.SUPPRESS,
+                                help="定向发布目标设备，可重复；启动时只在这些设备中选择，"
+                                     "均须版本等于 previous-version 且未被进行中/暂停发布占用")
     release_create.set_defaults(handler=cmd_release_create, mutating=True)
     add_state_option(release_create)
 
@@ -606,6 +653,10 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    # 合并子命令前后出现的 --target-device-id（分别解析到不同 dest，避免 append 被覆盖）
+    pre = getattr(args, "target_device_id_pre", None)
+    post = getattr(args, "target_device_id", None)
+    args.target_device_id = (pre or []) + (post or []) if (pre is not None or post is not None) else None
     handler = getattr(args, "handler", None)
     if handler is None:
         parser.print_help()

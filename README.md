@@ -24,7 +24,8 @@ python -m ota_canary device heartbeat --device-id d1 --version 1.0.0 --heartbeat
 python -m ota_canary release create --release-id R1 --version 2.0.0 \
     --previous-version 1.0.0 --batch-size 2 --max-failure-percent 50 \
     [--max-release-failure-percent 30] \
-    [--heartbeat-timeout-seconds 900] [--stabilization-seconds 0]
+    [--heartbeat-timeout-seconds 900] [--stabilization-seconds 0] \
+    [--target-device-id d1 --target-device-id d2]
 python -m ota_canary release start --release-id R1
 
 # 当前批设备上报结果
@@ -64,6 +65,24 @@ python -m ota_canary status --release-id R1
   `release_failure_threshold`，未回滚或旧状态原因不明时为 `null`。
 - 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中发布占用的设备，
   按 `device-id` 升序分批；空匹配的发布直接 `completed`。
+- `release create` 可选、可重复的 `--target-device-id` 用于定向灰度：显式指定后，本次
+  发布只升级给定设备，`release start` 不再自动吸收全部符合版本条件的设备。该参数可放在
+  子命令前后并混用，多次出现按出现顺序合并。取值修剪后为空返回 `InvalidArgument`；
+  同一 device-id 重复给出（即使分散在子命令前后）返回 `InvalidArgument`；两种情况都不创建
+  发布。发布视图含 `targetDeviceIds`：显式指定时按 device-id 升序返回目标集合；未指定或
+  读取缺少该字段的旧状态时为 `null`，旧发布继续采用全量选择行为，且不重写历史记录。
+- 定向发布启动时，`release start` 只在目标集合内选择 `currentVersion == previousVersion`
+  且未被 `in_progress`/`paused` 发布占用的设备，仍按 device-id 升序分批；目标集合本身已
+  排序，故批次顺序确定。目标设备不存在返回 `DeviceNotFound`；目标设备存在但版本不等于
+  `previousVersion`，或正被其他进行中/暂停发布占用，返回 `InvalidArgument`。存在性先于
+  版本与占用校验。这些启动失败都不修改发布状态、批次、报告、设备版本、心跳或占用关系
+  （发布仍为 `pending`、`batches` 为空）。非空目标集合要求全部合法，因此校验通过即有
+  成员；当目标集合为空（如状态中记录为空列表，目标合法性空真）时，发布直接 `completed`，
+  与全量选择下的空匹配结果一致。
+- 定向发布启动后，`device report`、`release check` 的超时判定、逐批失败率、可选的发布级
+  累计失败率、`stabilization-seconds` 观察推进、`pause`/`resume`/`abort`、`status` 的
+  既有字段与结果语义保持不变；迟到报告、设备占用解除、非零退出码、stderr JSON 错误以及
+  失败命令不落盘也保持不变。未纳入目标集合的设备不受发布影响（版本不改变、不被占用）。
 - `release check --at <时刻>` 仅处理 `in_progress` 发布：对当前批尚未显式上报结果的设备，
   将其 `heartbeatAt` 与 `at` 换算为 UTC 瞬间，当 `at` 严格晚于 `heartbeatAt + 超时秒数` 时，
   写入 `result=failure`、`reason=timeout`，`heartbeatAt` 保留设备原值；已有显式结果不覆盖。
