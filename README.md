@@ -33,6 +33,10 @@ python -m ota_canary device report --release-id R1 --device-id d1 \
 # 按给定时刻收批心跳超时设备（仅处理 in_progress 发布）
 python -m ota_canary release check --release-id R1 --at 2026-10-01T10:00:00Z
 
+# 暂停 / 恢复发布
+python -m ota_canary release pause --release-id R1
+python -m ota_canary release resume --release-id R1
+
 # 查看发布状态
 python -m ota_canary status --release-id R1
 ```
@@ -42,8 +46,19 @@ python -m ota_canary status --release-id R1
 - 版本号格式为 `MAJOR.MINOR.PATCH`，时间为 ISO 8601（支持 `Z` 后缀，无偏移按 UTC）。
 - `release create` 可选 `--heartbeat-timeout-seconds`，为大于等于 1 的整数，缺省 `900`；
   发布视图含 `heartbeatTimeoutSeconds`，缺少该字段的旧发布按 `900` 计。
-- 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中发布占用的设备，
-  按 `device-id` 升序分批；空匹配的发布直接 `completed`。
+- 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中或暂停中发布占用的设备，
+  按 `device-id` 升序分批；空匹配的发布直接 `completed`。暂停中的发布在进入
+  `completed` 或 `rolled_back` 后才解除设备占用。
+- `release pause` 仅对 `in_progress` 发布生效：状态改为 `paused`，原样保留
+  `batches`、`currentBatch`、`reports`、设备版本与心跳；`release resume` 仅对
+  `paused` 发布生效，恢复为 `in_progress`，从同一批次继续，不重建批次或报告。
+  对 `pending`/`completed`/`rolled_back` 发布执行 pause，或对非 `paused` 发布执行
+  resume，均返回 `InvalidState`；发布不存在返回 `DeviceNotFound`。
+- 暂停期间 `device report` 与 `release check` 对该发布返回 `InvalidState`：不写报告、
+  不推进批次、不改变设备；`status` 仍可只读查看（此时 `pendingDevices` 为 `[]`），
+  `device add` 与 `device heartbeat` 按既有规则工作。恢复后未上报设备可继续报告，
+  超过 `heartbeatAt + heartbeatTimeoutSeconds` 的设备仍由 `release check --at`
+  判为 timeout，整批集齐后的推进与回滚判定不变。
 - `release check --at <时刻>` 仅处理 `in_progress` 发布：对当前批尚未显式上报结果的设备，
   将其 `heartbeatAt` 与 `at` 换算为 UTC 瞬间，当 `at` 严格晚于 `heartbeatAt + 超时秒数` 时，
   写入 `result=failure`、`reason=timeout`，`heartbeatAt` 保留设备原值；已有显式结果不覆盖。
@@ -57,7 +72,8 @@ python -m ota_canary status --release-id R1
 - 失败命令以非零退出码结束，向 stderr 输出 JSON 错误，且不修改状态文件。
   错误码：`DeviceNotFound`（设备或发布不存在）、`DeviceExists`（重复登记或重复发布）、
   `InvalidArgument`（参数非法、重复、非当前批或已超时报告、非法 `at`/`heartbeat-timeout-seconds`）、
-  `InvalidState`（对 pending/completed/rolled_back 发布执行 check，或推进非进行中发布）。
+  `InvalidState`（对 pending/completed/rolled_back 发布执行 check，推进非进行中发布，
+  对非 in_progress 发布 pause，或对非 paused 发布 resume）。
 
 ## 约定
 

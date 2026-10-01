@@ -270,7 +270,7 @@ def cmd_release_start(state, args):
         raise InvalidState("release %s is not pending (status: %s)" % (release_id, release["status"]))
     occupied = set()
     for other in state["releases"].values():
-        if other["status"] == "in_progress":
+        if other["status"] in ("in_progress", "paused"):
             for batch in other["batches"]:
                 occupied.update(batch)
     eligible = sorted(
@@ -283,6 +283,26 @@ def cmd_release_start(state, args):
     release["currentBatch"] = 0
     release["reports"] = {}
     release["status"] = "in_progress" if release["batches"] else "completed"
+    return release_view(state, release)
+
+
+def cmd_release_pause(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "in_progress":
+        raise InvalidState("release %s is not in progress (status: %s)" % (release_id, release["status"]))
+    # 冻结当前批次：batches、currentBatch、reports、设备版本与心跳原样保留
+    release["status"] = "paused"
+    return release_view(state, release)
+
+
+def cmd_release_resume(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "paused":
+        raise InvalidState("release %s is not paused (status: %s)" % (release_id, release["status"]))
+    # 从同一批次继续，不重建批次或报告
+    release["status"] = "in_progress"
     return release_view(state, release)
 
 
@@ -436,6 +456,16 @@ def build_parser():
     release_start.add_argument("--release-id", required=True)
     release_start.set_defaults(handler=cmd_release_start, mutating=True)
     add_state_option(release_start)
+
+    release_pause = release_sub.add_parser("pause", help="暂停进行中的发布，冻结当前批次")
+    release_pause.add_argument("--release-id", required=True)
+    release_pause.set_defaults(handler=cmd_release_pause, mutating=True)
+    add_state_option(release_pause)
+
+    release_resume = release_sub.add_parser("resume", help="恢复暂停的发布，从当前批次继续")
+    release_resume.add_argument("--release-id", required=True)
+    release_resume.set_defaults(handler=cmd_release_resume, mutating=True)
+    add_state_option(release_resume)
 
     release_check = release_sub.add_parser("check", help="按给定时刻收批心跳超时设备")
     release_check.add_argument("--release-id", required=True)
