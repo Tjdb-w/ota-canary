@@ -12,9 +12,10 @@ import os
 import re
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 DEFAULT_STATE_FILE = "ota-canary-state.json"
+DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 900
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 VALID_RESULTS = ("success", "failure")
@@ -70,10 +71,18 @@ def require_time(value):
     text = value.strip()
     candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
     try:
-        datetime.fromisoformat(candidate)
+        parsed = datetime.fromisoformat(candidate)
     except ValueError:
         raise InvalidArgument("invalid timestamp: %r (expected ISO 8601)" % (value,))
-    return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return value, parsed.astimezone(timezone.utc)
+
+
+def parse_time(value):
+    """将已校验的 ISO 8601 字符串换算为 UTC 瞬间；无偏移按 UTC。"""
+    _, instant = require_time(value)
+    return instant
 
 
 def require_int(value, name):
@@ -95,6 +104,13 @@ def require_max_failure_percent(value):
     if percent < 0 or percent > 100:
         raise InvalidArgument("max-failure-percent must be between 0 and 100: %r" % (value,))
     return percent
+
+
+def require_heartbeat_timeout_seconds(value):
+    seconds = require_int(value, "heartbeat-timeout-seconds")
+    if seconds < 1:
+        raise InvalidArgument("heartbeat-timeout-seconds must be >= 1: %r" % (value,))
+    return seconds
 
 
 def require_result(value):
@@ -169,6 +185,9 @@ def release_view(state, release):
         "previousVersion": release["previousVersion"],
         "batchSize": release["batchSize"],
         "maxFailurePercent": release["maxFailurePercent"],
+        "heartbeatTimeoutSeconds": release.get(
+            "heartbeatTimeoutSeconds", DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+        ),
         "status": release["status"],
         "currentBatch": current,
         "batchCount": len(batches),
@@ -199,7 +218,7 @@ def get_device(state, device_id):
 def cmd_device_add(state, args):
     device_id = require_id(args.device_id, "device-id")
     version = require_version(args.version)
-    heartbeat_at = require_time(args.heartbeat_at)
+    heartbeat_at, _ = require_time(args.heartbeat_at)
     if device_id in state["devices"]:
         raise DeviceExists("device already registered: %s" % device_id)
     record = {"deviceId": device_id, "version": version, "heartbeatAt": heartbeat_at}
@@ -210,7 +229,7 @@ def cmd_device_add(state, args):
 def cmd_device_heartbeat(state, args):
     device_id = require_id(args.device_id, "device-id")
     version = require_version(args.version)
-    heartbeat_at = require_time(args.heartbeat_at)
+    heartbeat_at, _ = require_time(args.heartbeat_at)
     device = get_device(state, device_id)
     device["version"] = version
     device["heartbeatAt"] = heartbeat_at
@@ -223,6 +242,9 @@ def cmd_release_create(state, args):
     previous_version = require_version(args.previous_version)
     batch_size = require_batch_size(args.batch_size)
     max_failure_percent = require_max_failure_percent(args.max_failure_percent)
+    heartbeat_timeout_seconds = require_heartbeat_timeout_seconds(
+        args.heartbeat_timeout_seconds
+    )
     if release_id in state["releases"]:
         raise DeviceExists("release already exists: %s" % release_id)
     release = {
@@ -231,6 +253,7 @@ def cmd_release_create(state, args):
         "previousVersion": previous_version,
         "batchSize": batch_size,
         "maxFailurePercent": max_failure_percent,
+        "heartbeatTimeoutSeconds": heartbeat_timeout_seconds,
         "status": "pending",
         "batches": [],
         "currentBatch": 0,
@@ -267,7 +290,7 @@ def cmd_device_report(state, args):
     release_id = require_id(args.release_id, "release-id")
     device_id = require_id(args.device_id, "device-id")
     result = require_result(args.result)
-    heartbeat_at = require_time(args.heartbeat_at)
+    heartbeat_at, _ = require_time(args.heartbeat_at)
     release = get_release(state, release_id)
     device = get_device(state, device_id)
     if release["status"] != "in_progress":
@@ -275,7 +298,10 @@ def cmd_device_report(state, args):
     current_batch = release["batches"][release["currentBatch"]]
     if device_id not in current_batch:
         raise InvalidArgument("device %s is not in the current batch of release %s" % (device_id, release_id))
-    if device_id in release["reports"]:
+    existing = release["reports"].get(device_id)
+    if existing is not None:
+        if existing.get("reason") == "timeout":
+            raise InvalidArgument("device %s has timed out in release %s" % (device_id, release_id))
         raise InvalidArgument("device %s already reported for release %s" % (device_id, release_id))
     release["reports"][device_id] = {"result": result, "heartbeatAt": heartbeat_at}
     device["heartbeatAt"] = heartbeat_at
@@ -284,6 +310,40 @@ def cmd_device_report(state, args):
     advance_if_batch_complete(state, release)
     view = release_view(state, release)
     view["report"] = {"deviceId": device_id, "result": result, "heartbeatAt": heartbeat_at}
+    return view
+
+
+def cmd_release_check(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    _, at_instant = require_time(args.at)
+    if release["status"] != "in_progress":
+        raise InvalidState("release %s is not in progress (status: %s)" % (release_id, release["status"]))
+    timeout = timedelta(
+        seconds=release.get("heartbeatTimeoutSeconds", DEFAULT_HEARTBEAT_TIMEOUT_SECONDS)
+    )
+    batch = release["batches"][release["currentBatch"]]
+    reports = release["reports"]
+    expired = []
+    for device_id in batch:
+        if device_id in reports:
+            continue
+        device = state["devices"].get(device_id)
+        heartbeat_at = device.get("heartbeatAt") if device is not None else None
+        if heartbeat_at is None:
+            continue
+        if at_instant > parse_time(heartbeat_at) + timeout:
+            # 显式结果永不覆盖；heartbeatAt 保留设备原值
+            reports[device_id] = {
+                "result": "failure",
+                "reason": "timeout",
+                "heartbeatAt": heartbeat_at,
+            }
+            expired.append(device_id)
+    expired.sort()
+    advance_if_batch_complete(state, release)
+    view = release_view(state, release)
+    view["expiredDevices"] = expired
     return view
 
 
@@ -366,6 +426,9 @@ def build_parser():
     release_create.add_argument("--previous-version", required=True)
     release_create.add_argument("--batch-size", required=True)
     release_create.add_argument("--max-failure-percent", required=True)
+    release_create.add_argument("--heartbeat-timeout-seconds",
+                                default=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+                                help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
     release_create.set_defaults(handler=cmd_release_create, mutating=True)
     add_state_option(release_create)
 
@@ -373,6 +436,12 @@ def build_parser():
     release_start.add_argument("--release-id", required=True)
     release_start.set_defaults(handler=cmd_release_start, mutating=True)
     add_state_option(release_start)
+
+    release_check = release_sub.add_parser("check", help="按给定时刻收批心跳超时设备")
+    release_check.add_argument("--release-id", required=True)
+    release_check.add_argument("--at", required=True, help="判定时刻（ISO 8601）")
+    release_check.set_defaults(handler=cmd_release_check, mutating=True)
+    add_state_option(release_check)
 
     status = subparsers.add_parser("status", help="查看发布状态")
     status.add_argument("--release-id", required=True)
