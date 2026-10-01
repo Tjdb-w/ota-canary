@@ -142,6 +142,23 @@ def require_result(value):
     return value
 
 
+MAX_ABORT_REASON_CHARS = 200
+
+
+def require_abort_reason(value):
+    if not isinstance(value, str):
+        raise InvalidArgument("reason must be a string: %r" % (value,))
+    reason = value.strip()
+    if not reason:
+        raise InvalidArgument("reason must be non-empty after trimming")
+    if len(reason) > MAX_ABORT_REASON_CHARS:
+        raise InvalidArgument(
+            "reason must be at most %d characters: %d given"
+            % (MAX_ABORT_REASON_CHARS, len(reason))
+        )
+    return reason
+
+
 # ---------------------------------------------------------------------------
 # 状态读写
 # ---------------------------------------------------------------------------
@@ -218,6 +235,8 @@ def release_view(state, release):
         "stabilizationDeadline": release.get("stabilizationDeadline"),
         "status": release["status"],
         "stopReason": release.get("stopReason"),
+        "abortReason": release.get("abortReason"),
+        "abortedAt": release.get("abortedAt"),
         "currentBatch": current,
         "batchCount": len(batches),
         "batches": batches,
@@ -294,6 +313,8 @@ def cmd_release_create(state, args):
         "stabilizationDeadline": None,
         "status": "pending",
         "stopReason": None,
+        "abortReason": None,
+        "abortedAt": None,
         "batches": [],
         "currentBatch": 0,
         "reports": {},
@@ -401,6 +422,21 @@ def cmd_release_resume(state, args):
     if release["status"] != "paused":
         raise InvalidState("release %s is not paused (status: %s)" % (release_id, release["status"]))
     release["status"] = "in_progress"
+    return release_view(state, release)
+
+
+def cmd_release_abort(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    reason = require_abort_reason(args.reason)
+    _, at_instant = require_time(args.at)
+    release = get_release(state, release_id)
+    if release["status"] not in ("in_progress", "paused"):
+        raise InvalidState(
+            "release %s cannot be aborted (status: %s)" % (release_id, release["status"])
+        )
+    roll_back(state, release, "manual_abort")
+    release["abortReason"] = reason
+    release["abortedAt"] = format_instant(at_instant)
     return release_view(state, release)
 
 
@@ -550,6 +586,14 @@ def build_parser():
     release_resume.add_argument("--release-id", required=True)
     release_resume.set_defaults(handler=cmd_release_resume, mutating=True)
     add_state_option(release_resume)
+
+    release_abort = release_sub.add_parser("abort", help="人工终止异常发布并回滚")
+    release_abort.add_argument("--release-id", required=True)
+    release_abort.add_argument("--reason", required=True,
+                               help="人工终止原因，去除首尾空白后 1 到 200 个字符")
+    release_abort.add_argument("--at", required=True, help="终止时刻（ISO 8601）")
+    release_abort.set_defaults(handler=cmd_release_abort, mutating=True)
+    add_state_option(release_abort)
 
     status = subparsers.add_parser("status", help="查看发布状态")
     status.add_argument("--release-id", required=True)
