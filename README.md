@@ -38,6 +38,10 @@ python -m ota_canary release check --release-id R1 --at 2026-10-01T10:00:00Z
 python -m ota_canary release pause --release-id R1
 python -m ota_canary release resume --release-id R1
 
+# 人工止损：终止异常发布并恢复稳定版本
+python -m ota_canary release abort --release-id R1 \
+    --reason "电源模块异常率升高" --at 2026-10-01T11:00:00Z
+
 # 查看发布状态
 python -m ota_canary status --release-id R1
 ```
@@ -57,7 +61,9 @@ python -m ota_canary status --release-id R1
 - 发布视图含 `reportedCount`、`failedCount` 与 `stopReason`：`reportedCount` 为已有
   结果数（含显式上报与超时补写结果），`failedCount` 为其中 `result=failure` 的数量；
   `stopReason` 在逐批回滚时为 `batch_failure_threshold`、累计回滚时为
-  `release_failure_threshold`，未回滚或旧状态原因不明时为 `null`。
+  `release_failure_threshold`、人工终止时为 `manual_abort`，未回滚或旧状态原因不明时为
+  `null`。视图另含 `abortReason` 与 `abortedAt`：人工终止时分别为修剪后的原因与
+  UTC `Z` 时间；非人工终止或旧状态缺少这两个字段时为 `null`，不补写历史。
 - 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中发布占用的设备，
   按 `device-id` 升序分批；空匹配的发布直接 `completed`。
 - `release check --at <时刻>` 仅处理 `in_progress` 发布：对当前批尚未显式上报结果的设备，
@@ -89,6 +95,18 @@ python -m ota_canary status --release-id R1
   `device heartbeat` 按既有规则工作。对 `pending`/`completed`/`rolled_back`
   发布执行 pause，或对非 `paused` 发布执行 resume，均返回 `InvalidState`；
   发布不存在返回 `DeviceNotFound`。
+- `release abort --reason <原因> --at <时刻>` 为独立人工止损入口，仅接受
+  `in_progress` 或 `paused` 发布。成功后发布进入 `rolled_back`，`stopReason` 为
+  `manual_abort`，`abortReason` 为去除首尾空白后的原因，`abortedAt` 为按 UTC 规范
+  输出的 `Z` 时间。所有 `batches` 内设备——不论已报告、当前批或未开始——`version`
+  均恢复为 `previousVersion`；`reports`、设备 `heartbeatAt`、`batches` 保持原值，
+  `stabilizationDeadline` 清空并随发布终止解除设备占用。终止后该发布的
+  `device report` 与 `release check` 返回 `InvalidState`，`status` 仍可查询。
+  `manual_abort` 不改变 `batch_failure_threshold` 与 `release_failure_threshold`
+  的口径，自动逐批回滚、发布级失败预算、超时边界、稳定观察、暂停恢复、空批次完成、
+  设备选择与占用规则均保持不变。reason 修剪后为空或超过 200 个 Unicode 字符、
+  `at` 非法时返回 `InvalidArgument`；发布不存在返回 `DeviceNotFound`；对
+  `pending`/`completed`/`rolled_back` 发布执行返回 `InvalidState`。
 - 其他发布选择设备时尊重暂停中的发布：`paused` 发布已占用的设备不会被新的
   `release start` 纳入候选；设备占用在发布进入 `completed` 或 `rolled_back` 后解除。
 - 已超时设备或非当前批设备的迟到 `device report` 返回 `InvalidArgument`。
@@ -98,7 +116,8 @@ python -m ota_canary status --release-id R1
   `InvalidArgument`（参数非法、重复、非当前批或已超时报告、非法 `at`/`heartbeat-timeout-seconds`/`stabilization-seconds`/`max-release-failure-percent`）、
   `InvalidState`（对 pending/completed/rolled_back 发布执行 check，或推进非进行中发布；
   对非 in_progress 发布 pause、对非 paused 发布 resume；暂停期间对 paused 发布执行
-  `device report` 或 `release check`）。
+  `device report` 或 `release check`；对非 in_progress/paused 发布执行
+  `release abort`；人工终止后再对该发布执行 `device report` 或 `release check`）。
 
 ## 约定
 

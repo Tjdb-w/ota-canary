@@ -218,6 +218,8 @@ def release_view(state, release):
         "stabilizationDeadline": release.get("stabilizationDeadline"),
         "status": release["status"],
         "stopReason": release.get("stopReason"),
+        "abortReason": release.get("abortReason"),
+        "abortedAt": release.get("abortedAt"),
         "currentBatch": current,
         "batchCount": len(batches),
         "batches": batches,
@@ -404,6 +406,28 @@ def cmd_release_resume(state, args):
     return release_view(state, release)
 
 
+def cmd_release_abort(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    reason = args.reason.strip() if isinstance(args.reason, str) else ""
+    if not reason:
+        raise InvalidArgument("reason must be a non-empty string")
+    if len(reason) > 200:
+        raise InvalidArgument("reason must be at most 200 characters")
+    _, at_instant = require_time(args.at)
+    release = get_release(state, release_id)
+    if release["status"] not in ("in_progress", "paused"):
+        raise InvalidState(
+            "release %s is not in progress or paused (status: %s)"
+            % (release_id, release["status"])
+        )
+    # 人工止损：沿用逐批回滚口径恢复所有已纳入批次设备的版本，再记录审计字段；
+    # reports、heartbeatAt、batches 保持原值，仅清空观察截止时刻并解除占用。
+    roll_back(state, release, "manual_abort")
+    release["abortReason"] = reason
+    release["abortedAt"] = format_instant(at_instant)
+    return release_view(state, release)
+
+
 def roll_back(state, release, stop_reason):
     """按既有口径回滚：恢复已纳入批次设备版本，记录停止原因并解除发布占用。"""
     release["status"] = "rolled_back"
@@ -550,6 +574,13 @@ def build_parser():
     release_resume.add_argument("--release-id", required=True)
     release_resume.set_defaults(handler=cmd_release_resume, mutating=True)
     add_state_option(release_resume)
+
+    release_abort = release_sub.add_parser("abort", help="人工终止异常发布并回滚")
+    release_abort.add_argument("--release-id", required=True)
+    release_abort.add_argument("--reason", required=True, help="人工止损原因")
+    release_abort.add_argument("--at", required=True, help="终止时刻（ISO 8601）")
+    release_abort.set_defaults(handler=cmd_release_abort, mutating=True)
+    add_state_option(release_abort)
 
     status = subparsers.add_parser("status", help="查看发布状态")
     status.add_argument("--release-id", required=True)
