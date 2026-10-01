@@ -85,6 +85,11 @@ def parse_time(value):
     return instant
 
 
+def format_instant(instant):
+    """将 UTC 瞬间格式化为 ISO 8601 字符串（Z 后缀）。"""
+    return instant.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def require_int(value, name):
     try:
         return int(str(value).strip())
@@ -110,6 +115,13 @@ def require_heartbeat_timeout_seconds(value):
     seconds = require_int(value, "heartbeat-timeout-seconds")
     if seconds < 1:
         raise InvalidArgument("heartbeat-timeout-seconds must be >= 1: %r" % (value,))
+    return seconds
+
+
+def require_stabilization_seconds(value):
+    seconds = require_int(value, "stabilization-seconds")
+    if seconds < 0:
+        raise InvalidArgument("stabilization-seconds must be >= 0: %r" % (value,))
     return seconds
 
 
@@ -188,6 +200,8 @@ def release_view(state, release):
         "heartbeatTimeoutSeconds": release.get(
             "heartbeatTimeoutSeconds", DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
         ),
+        "stabilizationSeconds": release.get("stabilizationSeconds", 0),
+        "stabilizationDeadline": release.get("stabilizationDeadline"),
         "status": release["status"],
         "currentBatch": current,
         "batchCount": len(batches),
@@ -245,6 +259,7 @@ def cmd_release_create(state, args):
     heartbeat_timeout_seconds = require_heartbeat_timeout_seconds(
         args.heartbeat_timeout_seconds
     )
+    stabilization_seconds = require_stabilization_seconds(args.stabilization_seconds)
     if release_id in state["releases"]:
         raise DeviceExists("release already exists: %s" % release_id)
     release = {
@@ -254,6 +269,8 @@ def cmd_release_create(state, args):
         "batchSize": batch_size,
         "maxFailurePercent": max_failure_percent,
         "heartbeatTimeoutSeconds": heartbeat_timeout_seconds,
+        "stabilizationSeconds": stabilization_seconds,
+        "stabilizationDeadline": None,
         "status": "pending",
         "batches": [],
         "currentBatch": 0,
@@ -341,7 +358,7 @@ def cmd_release_check(state, args):
             }
             expired.append(device_id)
     expired.sort()
-    advance_if_batch_complete(state, release)
+    advance_if_batch_complete(state, release, at_instant)
     view = release_view(state, release)
     view["expiredDevices"] = expired
     return view
@@ -365,7 +382,7 @@ def cmd_release_resume(state, args):
     return release_view(state, release)
 
 
-def advance_if_batch_complete(state, release):
+def advance_if_batch_complete(state, release, at_instant=None):
     batches = release["batches"]
     current = release["currentBatch"]
     batch = batches[current]
@@ -374,13 +391,28 @@ def advance_if_batch_complete(state, release):
         return
     failed = sum(1 for device_id in batch if reports[device_id]["result"] == "failure")
     if failed * 100 > len(batch) * release["maxFailurePercent"]:
+        # 失败率超阈值立即回滚，不进入稳定观察
         release["status"] = "rolled_back"
+        release["stabilizationDeadline"] = None
         for group in batches:
             for device_id in group:
                 device = state["devices"].get(device_id)
                 if device is not None:
                     device["version"] = release["previousVersion"]
-    elif current + 1 == len(batches):
+        return
+    stabilization_seconds = release.get("stabilizationSeconds", 0)
+    if stabilization_seconds > 0:
+        deadline_text = release.get("stabilizationDeadline")
+        if deadline_text is None:
+            # 整批集齐：以本批报告中最晚的 heartbeatAt 起算观察截止时刻
+            latest = max(parse_time(reports[device_id]["heartbeatAt"]) for device_id in batch)
+            deadline_text = format_instant(latest + timedelta(seconds=stabilization_seconds))
+            release["stabilizationDeadline"] = deadline_text
+        if at_instant is None or at_instant <= parse_time(deadline_text):
+            # 观察期内保持 currentBatch；仅 release check 越过截止时刻才推进
+            return
+    release["stabilizationDeadline"] = None
+    if current + 1 == len(batches):
         release["status"] = "completed"
     else:
         release["currentBatch"] = current + 1
@@ -447,6 +479,8 @@ def build_parser():
     release_create.add_argument("--heartbeat-timeout-seconds",
                                 default=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
                                 help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
+    release_create.add_argument("--stabilization-seconds", default=0,
+                                help="批次稳定观察秒数，>=0 的整数（默认 %(default)s）")
     release_create.set_defaults(handler=cmd_release_create, mutating=True)
     add_state_option(release_create)
 
