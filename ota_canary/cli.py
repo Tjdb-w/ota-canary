@@ -111,6 +111,18 @@ def require_max_failure_percent(value):
     return percent
 
 
+def require_max_release_failure_percent(value):
+    # 缺省（None）表示不启用发布级累计失败预算，只做逐批判定
+    if value is None:
+        return None
+    percent = require_int(value, "max-release-failure-percent")
+    if percent < 0 or percent > 100:
+        raise InvalidArgument(
+            "max-release-failure-percent must be between 0 and 100: %r" % (value,)
+        )
+    return percent
+
+
 def require_heartbeat_timeout_seconds(value):
     seconds = require_int(value, "heartbeat-timeout-seconds")
     if seconds < 1:
@@ -191,20 +203,27 @@ def release_view(state, release):
                 "heartbeatAt": device.get("heartbeatAt"),
                 "report": reports.get(device_id),
             })
+    # 累计口径：显式上报与超时补收都计入 reports，其中 result=failure 计入失败
+    reported_count = len(reports)
+    failed_count = sum(1 for report in reports.values() if report.get("result") == "failure")
     return {
         "releaseId": release["releaseId"],
         "version": release["version"],
         "previousVersion": release["previousVersion"],
         "batchSize": release["batchSize"],
         "maxFailurePercent": release["maxFailurePercent"],
+        "maxReleaseFailurePercent": release.get("maxReleaseFailurePercent"),
         "heartbeatTimeoutSeconds": release.get(
             "heartbeatTimeoutSeconds", DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
         ),
         "stabilizationSeconds": release.get("stabilizationSeconds", 0),
         "stabilizationDeadline": release.get("stabilizationDeadline"),
         "status": release["status"],
+        "stopReason": release.get("stopReason"),
         "currentBatch": current,
         "batchCount": len(batches),
+        "reportedCount": reported_count,
+        "failedCount": failed_count,
         "batches": batches,
         "pendingDevices": pending,
         "devices": devices,
@@ -256,6 +275,9 @@ def cmd_release_create(state, args):
     previous_version = require_version(args.previous_version)
     batch_size = require_batch_size(args.batch_size)
     max_failure_percent = require_max_failure_percent(args.max_failure_percent)
+    max_release_failure_percent = require_max_release_failure_percent(
+        args.max_release_failure_percent
+    )
     heartbeat_timeout_seconds = require_heartbeat_timeout_seconds(
         args.heartbeat_timeout_seconds
     )
@@ -268,10 +290,12 @@ def cmd_release_create(state, args):
         "previousVersion": previous_version,
         "batchSize": batch_size,
         "maxFailurePercent": max_failure_percent,
+        "maxReleaseFailurePercent": max_release_failure_percent,
         "heartbeatTimeoutSeconds": heartbeat_timeout_seconds,
         "stabilizationSeconds": stabilization_seconds,
         "stabilizationDeadline": None,
         "status": "pending",
+        "stopReason": None,
         "batches": [],
         "currentBatch": 0,
         "reports": {},
@@ -382,13 +406,31 @@ def cmd_release_resume(state, args):
     return release_view(state, release)
 
 
+def rollback_release(state, release, stop_reason):
+    """按统一口径回滚：已纳入批次的设备恢复 previousVersion，并标记停止原因。"""
+    release["status"] = "rolled_back"
+    release["stabilizationDeadline"] = None
+    release["stopReason"] = stop_reason
+    for group in release["batches"]:
+        for device_id in group:
+            device = state["devices"].get(device_id)
+            if device is not None:
+                device["version"] = release["previousVersion"]
+
+
 def advance_if_batch_complete(state, release, at_instant=None):
     """整批集齐后决定回滚、观察或推进。
 
-    失败率超阈值立即 rolled_back；否则 stabilizationSeconds > 0 时进入观察：
-    保持 currentBatch，记录 stabilizationDeadline（当前批报告中最晚 heartbeatAt
-    加观察秒数），仅在 at_instant 严格晚于截止时刻时推进下一批或 completed。
-    at_instant 为 None（device report 路径）时只进入观察，不推进。
+    先按现有严格不等式判批失败率，超过即 rolled_back（stopReason=
+    batch_failure_threshold）；未超过且配置了发布级累计预算时，再判全程
+    failedCount*100 > reportedCount*maxReleaseFailurePercent，超过同样立即
+    rolled_back（stopReason=release_failure_threshold）。两种回滚均沿用统一
+    口径：恢复已纳入批次设备版本，迟到报告此后被 in_progress 检查拒绝。
+
+    均未触发时，stabilizationSeconds > 0 进入观察：保持 currentBatch，记录
+    stabilizationDeadline（当前批报告中最晚 heartbeatAt 加观察秒数），仅在
+    at_instant 严格晚于截止时刻时推进下一批或 completed。at_instant 为 None
+    （device report 路径）时只进入观察，不推进。
     """
     batches = release["batches"]
     current = release["currentBatch"]
@@ -398,13 +440,15 @@ def advance_if_batch_complete(state, release, at_instant=None):
         return
     failed = sum(1 for device_id in batch if reports[device_id]["result"] == "failure")
     if failed * 100 > len(batch) * release["maxFailurePercent"]:
-        release["status"] = "rolled_back"
-        release["stabilizationDeadline"] = None
-        for group in batches:
-            for device_id in group:
-                device = state["devices"].get(device_id)
-                if device is not None:
-                    device["version"] = release["previousVersion"]
+        rollback_release(state, release, "batch_failure_threshold")
+        return
+    reported_count = len(reports)
+    failed_count = sum(1 for report in reports.values() if report["result"] == "failure")
+    max_release_percent = release.get("maxReleaseFailurePercent")
+    if max_release_percent is not None and (
+        failed_count * 100 > reported_count * max_release_percent
+    ):
+        rollback_release(state, release, "release_failure_threshold")
         return
     stabilization = release.get("stabilizationSeconds", 0)
     if stabilization > 0:
@@ -480,6 +524,9 @@ def build_parser():
     release_create.add_argument("--previous-version", required=True)
     release_create.add_argument("--batch-size", required=True)
     release_create.add_argument("--max-failure-percent", required=True)
+    release_create.add_argument("--max-release-failure-percent", default=None,
+                                help="发布级累计失败百分比阈值，0-100 的整数；"
+                                     "缺省不启用累计预算，仅逐批判定")
     release_create.add_argument("--heartbeat-timeout-seconds",
                                 default=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
                                 help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
