@@ -20,7 +20,10 @@ python -m ota_canary batch create \
     --batch-size 2 --failure-threshold 0.5 --heartbeat-timeout-seconds 900 \
     --target-device-id d1 --target-device-id d2 --target-device-id d3
 
-# 开始放量：仅把第一批设备置为 pending_upgrade
+# 启动前只读预检：输出资格判定与分批计划，不改变任何状态
+python -m ota_canary batch plan --batch-id B1 [--at 2026-10-01T08:00:00Z]
+
+# 开始放量：资格与分批口径与 plan 完全一致；任一目标不合格则拒绝启动
 python -m ota_canary batch start --batch-id B1 [--at 2026-10-01T08:00:00Z]
 
 # 设备回传心跳时间、当前固件版本与升级终态（result 可省，表示仅心跳）
@@ -60,6 +63,29 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
    心跳超时不大于 0 → `InvalidBatchPolicy`
 5. 版本号格式非法、设备 ID 空/重复、设备未登记等参数问题沿用既有 `InvalidArgument`
    与 `DeviceNotFound`。
+
+## 启动前资格预检（batch plan；start 收紧）
+
+- `batch plan --batch-id B1 [--at 时间]` 对 `pending` 发布做**只读**预检：不创建
+  批次或设备阶段、不修改状态文件，重复调用结果一致。成功输出顶层固定为
+  `batchId`、`targetVersion`、`stableVersion`、`batchSize`、`targetDeviceIds`、
+  `eligibleDeviceIds`、`ineligibleDevices`、`candidateCount`、`batches`。
+- `targetDeviceIds` 为创建时去重集合并按 device-id 升序。
+- 资格判定：设备**当前版本等于 `stableVersion`**，且**未被其他** `in_progress` 或
+  `failed_stopped` 批次发布占用（占用以该发布的 `targetDeviceIds` 目标集合计）；
+  `completed`、`rolled_back`、`rollback_failed` 发布释放占用，不阻碍资格。
+- `eligibleDeviceIds` 升序列出全部合格设备，`candidateCount` 为其数量。
+- `ineligibleDevices` 按 device-id 升序，每项为 `deviceId` 与唯一 `reason`：
+  版本不符为 `VERSION_MISMATCH`，占用为 `DEVICE_BUSY`；两者兼有时
+  `VERSION_MISMATCH` 优先。
+- `batches` 只含合格设备，按 `batchSize` 切分；没有合格设备时为 `[]`。
+- `batch start` 使用与 `plan` **相同的资格、排序和分批口径**：任一目标不合格时
+  非零退出，stderr JSON 返回 `InvalidBatchEligibility`，消息按 device-id 升序列出
+  `设备 VERSION_MISMATCH|DEVICE_BUSY`；此时**不启动、不创建批次或阶段**，发布仍为
+  `pending`。全部合格时第一批设备为 `pending_upgrade`，其余批次为 `queued`。
+- `plan` 对不存在发布返回 `DeviceNotFound`，对非 `pending` 发布返回 `InvalidState`，
+  非法 `--at` 返回 `InvalidArgument`；目标设备缺失返回 `DeviceNotFound`（存在性先于
+  资格判定）。`start` 对同类条件沿用相同错误。
 
 ## 推进与停止
 
