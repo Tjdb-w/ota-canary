@@ -48,6 +48,10 @@ python -m ota_canary release abort --release-id R1 \
 
 # 查看发布状态
 python -m ota_canary status --release-id R1
+
+# 只读查看设备心跳与版本状态（全部设备 / 仅某发布批次）
+python -m ota_canary fleet status \
+    [--release-id R1] [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
 ```
 
 行为约定：
@@ -120,6 +124,23 @@ python -m ota_canary status --release-id R1
   `stabilizationSeconds` 为 `0` 时保持原推进时机。观察期间设备仍被占用，
   `pause`/`resume` 照常可用，恢复后从原批次与截止时刻继续。
 - `status` 保持只读，不补写超时结果，但 `devices[].report` 可读出 `reason=timeout`。
+- `fleet status` 为只读视图，不修改状态文件：可选 `--release-id`、`--at`、
+  `--heartbeat-timeout-seconds`。`--at` 按既有 ISO 8601 规则换算 UTC（支持 `Z`，
+  无偏移按 UTC），缺省取调用时 UTC 并以 `Z` 输出；`--heartbeat-timeout-seconds`
+  默认 `900`，只接受大于等于 `1` 的整数，非法值或非法 `--at` 返回 `InvalidArgument`。
+  成功输出顶层固定为 `at`、`heartbeatTimeoutSeconds`、`summary`、`devices`：
+  `devices` 按 device-id 升序，每项为 `deviceId`、`version`、`heartbeatAt`、
+  `ageSeconds`、`heartbeatState`、`releaseId`、`report`。`ageSeconds` 为观察时刻减
+  `heartbeatAt` 的向下取整秒，心跳等于或晚于观察时刻时为 `0`，心跳缺失为 `null`；
+  `heartbeatAt` 严格早于观察时刻减 timeout 时 `heartbeatState` 为 `stale`，否则
+  `fresh`，心跳缺失为 `unknown`。指定 `--release-id` 时只列该发布批次设备，
+  `releaseId` 取该发布标识，`report` 取该设备已有报告或 `null`；发布不存在返回
+  `DeviceNotFound`。未指定 `--release-id` 时列出全部设备：设备被 `in_progress` 或
+  `paused` 发布占用则 `releaseId` 取占用发布标识，否则为 `null`，`report` 恒为
+  `null`；同一设备被多个活动发布占用返回 `InvalidState`。`summary` 含
+  `totalDevices`、`freshCount`、`staleCount`、`unknownCount`、`occupiedCount`。
+  空状态返回零计数与空 `devices`；状态损坏返回 `InvalidState`。错误均走 stderr
+  JSON、非零退出且不改状态；`status` 与 `release plan` 的既有输出保持不变。
 - `release pause` 仅对 `in_progress` 发布生效：状态改为 `paused`，原样保留
   `batches`、`currentBatch`、`reports`、设备版本与心跳。`release resume` 仅对
   `paused` 发布生效：恢复为 `in_progress`，从同一批次继续，不重建批次或报告。
@@ -149,7 +170,8 @@ python -m ota_canary status --release-id R1
   非法 `abort` 原因）、
   `InvalidState`（对 pending/completed/rolled_back 发布执行 check，或推进非进行中发布；
   对非 in_progress 发布 pause、对非 paused 发布 resume；暂停期间对 paused 发布执行
-  `device report` 或 `release check`；对非 in_progress/paused 发布执行 `abort`）。
+  `device report` 或 `release check`；对非 in_progress/paused 发布执行 `abort`；
+  `fleet status` 发现状态损坏或同一设备被多个活动发布占用）。
 
 ## 约定
 

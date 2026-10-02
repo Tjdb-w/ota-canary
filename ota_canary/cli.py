@@ -572,6 +572,123 @@ def cmd_status(state, args):
     return release_view(state, release)
 
 
+def fleet_device_row(device_id, device, at_instant, stale_boundary):
+    """构造单设备的 fleet status 行；心跳时间已由调用方校验为 UTC 瞬间或 None。"""
+    heartbeat_text = device.get("heartbeatAt")
+    heartbeat_instant = parse_time(heartbeat_text) if heartbeat_text is not None else None
+    if heartbeat_instant is None:
+        age_seconds = None
+        heartbeat_state = "unknown"
+    else:
+        # timedelta 整除给出向下取整秒；心跳等于或晚于观察时刻时归零。
+        age_seconds = max(0, (at_instant - heartbeat_instant) // timedelta(seconds=1))
+        heartbeat_state = "stale" if heartbeat_instant < stale_boundary else "fresh"
+    return {
+        "deviceId": device_id,
+        "version": device.get("version"),
+        "heartbeatAt": heartbeat_text,
+        "ageSeconds": age_seconds,
+        "heartbeatState": heartbeat_state,
+    }
+
+
+def cmd_fleet_status(state, args):
+    if args.at is None:
+        at_instant = datetime.now(timezone.utc)
+    else:
+        _, at_instant = require_time(args.at)
+    timeout_seconds = require_heartbeat_timeout_seconds(args.heartbeat_timeout_seconds)
+    release_id_arg = args.release_id
+    if release_id_arg is not None:
+        release_id_arg = require_id(release_id_arg, "release-id")
+
+    devices = state.get("devices")
+    releases = state.get("releases")
+    if not isinstance(devices, dict) or not isinstance(releases, dict):
+        raise InvalidState("state file is corrupted")
+
+    stale_boundary = at_instant - timedelta(seconds=timeout_seconds)
+
+    def device_record(device_id):
+        record = devices.get(device_id, {})
+        if not isinstance(record, dict):
+            raise InvalidState("device record is corrupted: %s" % device_id)
+        heartbeat_text = record.get("heartbeatAt")
+        if heartbeat_text is not None:
+            try:
+                parse_time(heartbeat_text)
+            except InvalidArgument:
+                raise InvalidState("device %s has invalid heartbeatAt" % device_id)
+        return record
+
+    def batch_ids_of(release, ref):
+        batches = release.get("batches")
+        if not isinstance(batches, list):
+            raise InvalidState("release %s is corrupted" % ref)
+        ids = set()
+        for batch in batches:
+            if not isinstance(batch, list):
+                raise InvalidState("release %s is corrupted" % ref)
+            for device_id in batch:
+                if not isinstance(device_id, str):
+                    raise InvalidState("release %s is corrupted" % ref)
+                ids.add(device_id)
+        return ids
+
+    rows = []
+    if release_id_arg is not None:
+        release = get_release(state, release_id_arg)
+        if not isinstance(release, dict) or not isinstance(release.get("reports"), dict):
+            raise InvalidState("release %s is corrupted" % release_id_arg)
+        reports = release["reports"]
+        for device_id in sorted(batch_ids_of(release, release_id_arg)):
+            record = device_record(device_id)
+            row = fleet_device_row(device_id, record, at_instant, stale_boundary)
+            row["releaseId"] = release_id_arg
+            row["report"] = reports.get(device_id)
+            rows.append(row)
+    else:
+        # 扫描 in_progress/paused 发布的占用关系；正常状态下设备不会被多个活动发布占用，
+        # 出现冲突说明状态损坏。
+        occupancy = {}
+        for other_id, other in releases.items():
+            if not isinstance(other, dict):
+                raise InvalidState("release %s is corrupted" % other_id)
+            if other.get("status") not in ("in_progress", "paused"):
+                continue
+            for device_id in batch_ids_of(other, other_id):
+                owner = occupancy.get(device_id)
+                if owner is not None and owner != other_id:
+                    raise InvalidState(
+                        "device %s is occupied by multiple active releases: %s, %s"
+                        % (device_id, owner, other_id)
+                    )
+                occupancy[device_id] = other_id
+        for device_id in sorted(devices):
+            if not isinstance(device_id, str):
+                raise InvalidState("state file is corrupted")
+            record = device_record(device_id)
+            row = fleet_device_row(device_id, record, at_instant, stale_boundary)
+            owner = occupancy.get(device_id)
+            row["releaseId"] = owner
+            row["report"] = None
+            rows.append(row)
+
+    summary = {
+        "totalDevices": len(rows),
+        "freshCount": sum(1 for row in rows if row["heartbeatState"] == "fresh"),
+        "staleCount": sum(1 for row in rows if row["heartbeatState"] == "stale"),
+        "unknownCount": sum(1 for row in rows if row["heartbeatState"] == "unknown"),
+        "occupiedCount": sum(1 for row in rows if row["releaseId"] is not None),
+    }
+    return {
+        "at": format_instant(at_instant),
+        "heartbeatTimeoutSeconds": timeout_seconds,
+        "summary": summary,
+        "devices": rows,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 命令行解析
 # ---------------------------------------------------------------------------
@@ -680,6 +797,20 @@ def build_parser():
     status.add_argument("--release-id", required=True)
     status.set_defaults(handler=cmd_status, mutating=False)
     add_state_option(status)
+
+    fleet = subparsers.add_parser("fleet", help="设备 fleet 视图")
+    fleet_sub = fleet.add_subparsers(dest="fleet_command")
+
+    fleet_status = fleet_sub.add_parser("status", help="只读查看设备心跳与版本状态")
+    fleet_status.add_argument("--release-id", default=None,
+                              help="只列该发布批次设备；缺省列出全部设备")
+    fleet_status.add_argument("--at", default=None,
+                              help="观察时刻（ISO 8601）；缺省取调用时 UTC")
+    fleet_status.add_argument("--heartbeat-timeout-seconds",
+                              default=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+                              help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
+    fleet_status.set_defaults(handler=cmd_fleet_status, mutating=False)
+    add_state_option(fleet_status)
 
     return parser
 
