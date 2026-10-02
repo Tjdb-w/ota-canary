@@ -40,6 +40,10 @@ python -m ota_canary batch check --batch-id B1 --at 2026-10-01T10:00:00Z
 python -m ota_canary batch rollback-report --batch-id B1 --device-id d1 \
     --result success --version 1.0.0 --heartbeat-at 2026-10-01T10:10:00Z
 
+# 人工止损：仅 in_progress 可执行，固定 stopReason=manual_abort
+python -m ota_canary batch abort --batch-id B1 \
+    --reason 人工止损 --at 2026-10-01T10:00:00Z
+
 # 只读状态查询
 python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 ```
@@ -90,3 +94,21 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 - 自动停止后 `frozen=true`：后续批次及未取得终态的设备再上报返回 `InvalidState`，
   不再接收升级任务。
 - 回滚结果同样以首次为准：`pending` 之外重复相同结果幂等返回，冲突结果 `InvalidArgument`。
+
+## 人工止损（batch abort）
+
+- 仅 `in_progress` 批次可执行；批次不存在返回 `DeviceNotFound`；对 `pending`、
+  `failed_stopped`、`completed`、`rolled_back`、`rollback_failed` 执行返回
+  `InvalidState`。
+- `--reason` 修剪后为空或超过 200 个 Unicode 字符、`--at` 非法返回
+  `InvalidArgument`；所有校验失败发生在任何状态写入前（stderr JSON、非零退出、
+  不落盘）。
+- 中止后 `stopReason` 固定为 `manual_abort`，立即 `frozen=true` 冻结后续批次并
+  拒绝新的升级报告；仅**已成功**设备生成回滚到 `stableVersion` 的任务，失败、超时、
+  排队及未取得终态设备不生成任务，其阶段保留现场。
+- 尚有回滚任务时批次先保持 `failed_stopped`，回滚沿用 `rollback-report` 的首次结果
+  优先与幂等规则：全部成功或无任务时最终 `rolled_back`，任一失败则 `rollback_failed`。
+- `batch status` 在回滚期间显示 `frozen=true`、`stopReason=manual_abort`，保留批次、
+  报告、设备阶段与回滚计数；`abortReason` 为修剪后的 reason，`abortedAt` 为 `at`
+  换算后的 UTC（Z）时间。旧状态缺少这两个字段时分别显示 `null`，不补写历史。
+- 不改变阈值停止、设备版本、心跳、升级报告和回滚结果的既有行为。

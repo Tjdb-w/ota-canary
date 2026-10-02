@@ -229,6 +229,8 @@ def cmd_batch_create(state, args):
         "status": STATUS_PENDING,
         "frozen": False,
         "stopReason": None,
+        "abortReason": None,
+        "abortedAt": None,
         "batches": [],
         "currentBatch": None,
         "currentBatchStartedAt": None,
@@ -433,6 +435,21 @@ def finalize_batch_if_ready(state, rollout, at_instant):
         promote_batch(rollout, current + 1, at_instant)
 
 
+def freeze_for_rollback(rollout, stop_reason):
+    """冻结后续批次并向已成功升级设备下发回滚到 stableVersion 的任务。
+
+    失败、超时、排队及未取得终态的设备不生成任务，保留现场阶段。
+    """
+    rollout["status"] = STATUS_FAILED_STOPPED
+    rollout["frozen"] = True
+    rollout["stopReason"] = stop_reason
+    rollout["currentBatchStartedAt"] = None
+    for entry in rollout["devices"].values():
+        if entry["phase"] == PHASE_SUCCESS:
+            entry["phase"] = PHASE_ROLLING_BACK
+            entry["rollback"] = {"state": "pending", "heartbeatAt": None, "version": None}
+
+
 def trigger_failure_stop(state, rollout):
     """失败率超阈值：FAILED_STOPPED、冻结后续批次、向已成功设备下发回滚任务。
 
@@ -440,14 +457,29 @@ def trigger_failure_stop(state, rollout):
     rolled_back/rollback_failed；若没有需要回滚的设备，保持 failed_stopped 直到
     下一次 batch check（显式收批入口）收束为 rolled_back，保证停止状态外部可见。
     """
-    rollout["status"] = STATUS_FAILED_STOPPED
-    rollout["frozen"] = True
-    rollout["stopReason"] = "batch_failure_threshold"
-    rollout["currentBatchStartedAt"] = None
-    for entry in rollout["devices"].values():
-        if entry["phase"] == PHASE_SUCCESS:
-            entry["phase"] = PHASE_ROLLING_BACK
-            entry["rollback"] = {"state": "pending", "heartbeatAt": None, "version": None}
+    freeze_for_rollback(rollout, "batch_failure_threshold")
+
+
+def cmd_batch_abort(state, args):
+    """人工止损：仅 in_progress 可中止，固定 stopReason=manual_abort。
+
+    所有参数与存在性校验均在状态写入前完成；有回滚任务时先 failed_stopped，
+    由 rollback-report 既有首次结果优先与幂等规则收束；无任务时直接 rolled_back。
+    """
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    reason = cli.require_abort_reason(args.reason)
+    _, at_instant = cli.require_time(args.at)
+    rollout = get_rollout(state, batch_id)
+    if rollout["status"] != STATUS_IN_PROGRESS:
+        raise cli.InvalidState(
+            "batch %s cannot be aborted (status: %s)" % (batch_id, rollout["status"])
+        )
+    freeze_for_rollback(rollout, "manual_abort")
+    rollout["abortReason"] = reason
+    rollout["abortedAt"] = cli.format_instant(at_instant)
+    # 人工止损是显式入口，停止态已由本响应外部可见：无回滚任务时直接收束。
+    finalize_rollback_if_done(rollout, converge_empty=True)
+    return batch_view(state, rollout, at_instant=at_instant)
 
 
 def finalize_rollback_if_done(rollout, converge_empty=False):
@@ -617,6 +649,8 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
         "status": rollout["status"],
         "frozen": rollout["frozen"],
         "stopReason": rollout.get("stopReason"),
+        "abortReason": rollout.get("abortReason"),
+        "abortedAt": rollout.get("abortedAt"),
         "currentBatch": rollout["currentBatch"],
         "currentBatchStartedAt": rollout.get("currentBatchStartedAt"),
         "batchCount": len(rollout["batches"]),
@@ -752,3 +786,11 @@ def register_parsers(subparsers, add_state_option):
                               help="观察时刻（ISO 8601），缺省取当前 UTC；用于区分升级中/等待心跳")
     batch_status.set_defaults(handler=cmd_batch_status, mutating=False)
     add_state_option(batch_status)
+
+    batch_abort = batch_sub.add_parser("abort", help="人工止损进行中的批次并回滚已成功设备")
+    batch_abort.add_argument("--batch-id", required=True)
+    batch_abort.add_argument("--reason", required=True,
+                             help="人工止损原因，去除首尾空白后 1 到 200 个 Unicode 字符")
+    batch_abort.add_argument("--at", required=True, help="止损时刻（ISO 8601）")
+    batch_abort.set_defaults(handler=cmd_batch_abort, mutating=True)
+    add_state_option(batch_abort)
