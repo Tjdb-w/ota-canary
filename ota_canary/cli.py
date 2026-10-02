@@ -300,6 +300,10 @@ def cmd_device_heartbeat(state, args):
     device = get_device(state, device_id)
     device["version"] = version
     device["heartbeatAt"] = heartbeat_at
+    # 批次灰度（增量子系统）：公开心跳入口同时喂给包含该设备的进行中批次，
+    # 旁路实现，失败不影响本命令既有语义。
+    from . import batch_rollout
+    batch_rollout.feed_public_heartbeat(state, device_id, version, heartbeat_at)
     return dict(device)
 
 
@@ -811,6 +815,10 @@ def build_parser():
                               help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
     fleet_status.set_defaults(handler=cmd_fleet_status, mutating=False)
     add_state_option(fleet_status)
+
+    # 批次灰度推进与自动故障回滚（增量子系统），独立于上面的 release 能力。
+    from . import batch_rollout
+    batch_rollout.register_parsers(subparsers, add_state_option)
 
     return parser
 
