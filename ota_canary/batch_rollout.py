@@ -4,8 +4,11 @@
 
 - 沿用同一状态文件中的设备表（``devices``）作为公开设备/固件入口，新增
   ``firmwares`` 与 ``batchRollouts`` 两个状态键，不触碰 ``releases`` 的任何语义；
-- 新增 ``firmware register|list`` 与 ``batch create|start|report|check|
+- 新增 ``firmware register|list`` 与 ``batch create|plan|start|report|check|
   rollback-report|abort|status`` 命令，不改变既有命令的请求/响应；
+- ``batch plan`` 对 pending 发布做只读启动资格预检，``batch start`` 复用同一口径：
+  仅当前版本等于 stableVersion 且未被其他 in_progress/failed_stopped 发布占用的设备
+  合格，任一不合格即拒绝启动，全部合格时仅第一批置为 pending_upgrade；
 - 批次逐批放量，设备通过公开入口回传心跳、当前固件版本与升级终态；
 - 本批失败率严格大于阈值时自动 FAILED_STOPPED、冻结后续批次，并向已成功升级的
   设备下发回滚到稳定版本的任务，逐台记录 PENDING/成功/失败，最终 ROLLED_BACK
@@ -46,6 +49,15 @@ class InvalidBatchPolicy(cli.OtaError):
     code = "InvalidBatchPolicy"
 
 
+class InvalidBatchEligibility(cli.OtaError):
+    code = "InvalidBatchEligibility"
+
+
+# 启动前资格预检的不合格原因
+REASON_VERSION_MISMATCH = "VERSION_MISMATCH"
+REASON_DEVICE_BUSY = "DEVICE_BUSY"
+
+
 # 批次发布状态
 STATUS_PENDING = "pending"
 STATUS_IN_PROGRESS = "in_progress"
@@ -66,6 +78,10 @@ PHASE_ROLLBACK_SUCCEEDED = "rollback_succeeded"      # 回滚成功
 PHASE_ROLLBACK_FAILED = "rollback_failed"            # 回滚失败
 
 TERMINAL_PHASES = (PHASE_SUCCESS, PHASE_FAILED)
+
+# 占用设备的发布状态：仅 in_progress 与 failed_stopped 占用；
+# completed、rolled_back、rollback_failed 均释放。
+OCCUPYING_STATUSES = (STATUS_IN_PROGRESS, STATUS_FAILED_STOPPED)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +258,91 @@ def cmd_batch_create(state, args):
     return batch_view(state, rollout, at_instant=None)
 
 
+# ---------------------------------------------------------------------------
+# 启动前资格预检（batch plan 与 batch start 共用同一只读口径）
+# ---------------------------------------------------------------------------
+
+def occupied_device_ids(state, rollout):
+    """其他仍占用设备的发布：仅 in_progress 与 failed_stopped。
+
+    completed、rolled_back、rollback_failed 释放占用；pending 发布尚未建批，
+    也不占用。占用集合取占用发布创建时确定的去重目标设备集。
+    """
+    occupied = set()
+    for other in rollouts(state).values():
+        if other is rollout:
+            continue
+        if other.get("status") not in OCCUPYING_STATUSES:
+            continue
+        occupied.update(other.get("targetDeviceIds", ()))
+    return occupied
+
+
+def evaluate_eligibility(state, rollout):
+    """计算目标设备的启动资格（只读）。
+
+    返回 (target_ids, eligible_ids, ineligible, batches)：
+    - target_ids 为创建时去重集合，按 device-id 升序；
+    - 当前版本等于 stableVersion 且未被其他 in_progress/failed_stopped 发布占用者合格；
+    - 版本不符与占用兼一时 VERSION_MISMATCH 优先；
+    - batches 只含合格设备并按 batchSize 切分，无合格设备时为 []。
+    """
+    target_ids = sorted(rollout["targetDeviceIds"])
+    # 显式目标先确认仍然存在（DeviceNotFound），再判版本与占用资格。
+    for device_id in target_ids:
+        cli.get_device(state, device_id)
+    stable_version = rollout["stableVersion"]
+    busy = occupied_device_ids(state, rollout)
+    eligible_ids = []
+    ineligible = []
+    for device_id in target_ids:
+        device = state["devices"].get(device_id)
+        version = device.get("version") if isinstance(device, dict) else None
+        if version != stable_version:
+            ineligible.append({"deviceId": device_id, "reason": REASON_VERSION_MISMATCH})
+        elif device_id in busy:
+            ineligible.append({"deviceId": device_id, "reason": REASON_DEVICE_BUSY})
+        else:
+            eligible_ids.append(device_id)
+    size = rollout["batchSize"]
+    batches = [eligible_ids[i:i + size] for i in range(0, len(eligible_ids), size)]
+    return target_ids, eligible_ids, ineligible, batches
+
+
+def ineligible_message(ineligible):
+    """升序列出不合格设备及其唯一原因。"""
+    parts = [
+        "%s=%s" % (item["deviceId"], item["reason"])
+        for item in sorted(ineligible, key=lambda item: item["deviceId"])
+    ]
+    return "ineligible devices: " + ", ".join(parts)
+
+
+def cmd_batch_plan(state, args):
+    """对 pending 发布做只读启动预检：不改变状态，重复调用结果一致。"""
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    rollout = get_rollout(state, batch_id)
+    if rollout["status"] != STATUS_PENDING:
+        raise cli.InvalidState(
+            "batch %s is not pending (status: %s)" % (batch_id, rollout["status"])
+        )
+    if args.at is not None:
+        # 仅校验时刻合法性；预检结论本身与时刻无关。
+        cli.require_time(args.at)
+    target_ids, eligible_ids, ineligible, batches = evaluate_eligibility(state, rollout)
+    return {
+        "batchId": rollout["batchId"],
+        "targetVersion": rollout["targetVersion"],
+        "stableVersion": rollout["stableVersion"],
+        "batchSize": rollout["batchSize"],
+        "targetDeviceIds": target_ids,
+        "eligibleDeviceIds": eligible_ids,
+        "ineligibleDevices": ineligible,
+        "candidateCount": len(eligible_ids),
+        "batches": batches,
+    }
+
+
 def cmd_batch_start(state, args):
     batch_id = cli.require_id(args.batch_id, "batch-id")
     rollout = get_rollout(state, batch_id)
@@ -253,12 +354,12 @@ def cmd_batch_start(state, args):
         at_instant = datetime.now(timezone.utc)
     else:
         _, at_instant = cli.require_time(args.at)
-    # 再次确认设备仍然存在，且快照为当前设备表顺序（device-id 升序）。
-    ids = sorted(rollout["targetDeviceIds"])
-    for device_id in ids:
-        cli.get_device(state, device_id)
-    size = rollout["batchSize"]
-    rollout["batches"] = [ids[i:i + size] for i in range(0, len(ids), size)]
+    # 与 plan 完全相同的资格、排序与分批口径：任一目标不合格即拒绝启动，
+    # 不创建批次或设备阶段，不发生任何状态写入。
+    ids, eligible_ids, ineligible, planned_batches = evaluate_eligibility(state, rollout)
+    if ineligible:
+        raise InvalidBatchEligibility(ineligible_message(ineligible))
+    rollout["batches"] = planned_batches
     entries = rollout["devices"]
     for index, group in enumerate(rollout["batches"]):
         for device_id in group:
@@ -748,6 +849,13 @@ def register_parsers(subparsers, add_state_option):
                               help="目标设备，可重复；集合必须非空")
     batch_create.set_defaults(handler=cmd_batch_create, mutating=True)
     add_state_option(batch_create)
+
+    batch_plan = batch_sub.add_parser("plan", help="只读预检 pending 发布的启动资格与分批计划")
+    batch_plan.add_argument("--batch-id", required=True)
+    batch_plan.add_argument("--at", default=None,
+                            help="预检时刻（ISO 8601），仅做合法性校验，缺省取当前 UTC")
+    batch_plan.set_defaults(handler=cmd_batch_plan, mutating=False)
+    add_state_option(batch_plan)
 
     batch_start = batch_sub.add_parser("start", help="开始放量，仅把第一批置为待升级")
     batch_start.add_argument("--batch-id", required=True)
