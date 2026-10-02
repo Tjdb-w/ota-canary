@@ -300,6 +300,11 @@ def cmd_device_heartbeat(state, args):
     device = get_device(state, device_id)
     device["version"] = version
     device["heartbeatAt"] = heartbeat_at
+    # 批次灰度钩子：复用同一公开心跳入口驱动 canary 设备阶段；无批次时为空操作。
+    from . import canary as canary_mod
+
+    canary_mod.ensure_namespace(state)
+    canary_mod.on_device_heartbeat(state, device_id, version, heartbeat_at)
     return dict(device)
 
 
@@ -416,10 +421,35 @@ def cmd_release_plan(state, args):
 
 
 def cmd_device_report(state, args):
-    release_id = require_id(args.release_id, "release-id")
     device_id = require_id(args.device_id, "device-id")
     result = require_result(args.result)
     heartbeat_at, _ = require_time(args.heartbeat_at)
+    if bool(args.release_id) == bool(args.batch_id):
+        raise InvalidArgument("exactly one of --release-id or --batch-id must be provided")
+    release_id = require_id(args.release_id, "release-id") if args.release_id else None
+    # 批次灰度入口：--batch-id 与 --release-id 互斥；走独立 canary 语义。
+    if args.batch_id:
+        from . import canary as canary_mod
+
+        canary_mod.ensure_namespace(state)
+        phase = args.phase or canary_mod.PHASE_UPGRADE
+        if phase not in canary_mod.VALID_PHASES:
+            raise InvalidArgument(
+                "phase must be one of %s: %r" % ("/".join(canary_mod.VALID_PHASES), phase)
+            )
+        entry = canary_mod.report_terminal(
+            state, args.batch_id, device_id, result, heartbeat_at, phase
+        )
+        view = canary_mod.batch_view(state, canary_mod.get_batch(state, args.batch_id))
+        view["report"] = {
+            "batchId": args.batch_id,
+            "deviceId": device_id,
+            "phase": phase,
+            "result": result,
+            "heartbeatAt": heartbeat_at,
+            "stage": entry["stage"],
+        }
+        return view
     release = get_release(state, release_id)
     device = get_device(state, device_id)
     if release["status"] != "in_progress":
@@ -693,6 +723,32 @@ def cmd_fleet_status(state, args):
 # 命令行解析
 # ---------------------------------------------------------------------------
 
+
+def canary_cmd_firmware_add(state, args):
+    from . import canary
+    return canary.cmd_firmware_add(state, args)
+
+
+def canary_cmd_batch_create(state, args):
+    from . import canary
+    return canary.cmd_batch_create(state, args)
+
+
+def canary_cmd_batch_start(state, args):
+    from . import canary
+    return canary.cmd_batch_start(state, args)
+
+
+def canary_cmd_batch_check(state, args):
+    from . import canary
+    return canary.cmd_batch_check(state, args)
+
+
+def canary_cmd_batch_status(state, args):
+    from . import canary
+    return canary.cmd_batch_status(state, args)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="ota_canary",
@@ -728,7 +784,12 @@ def build_parser():
     add_state_option(device_heartbeat)
 
     device_report = device_sub.add_parser("report", help="上报当前批设备的升级结果")
-    device_report.add_argument("--release-id", required=True)
+    device_report.add_argument("--release-id", default=None,
+                               help="既有发布标识；与 --batch-id 二选一")
+    device_report.add_argument("--batch-id", default=None,
+                               help="批次灰度发布标识；与 --release-id 二选一")
+    device_report.add_argument("--phase", default=None,
+                               help="批次灰度的上报阶段：upgrade（默认）或 rollback")
     device_report.add_argument("--device-id", required=True)
     device_report.add_argument("--result", required=True)
     device_report.add_argument("--heartbeat-at", required=True)
@@ -811,6 +872,44 @@ def build_parser():
                               help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
     fleet_status.set_defaults(handler=cmd_fleet_status, mutating=False)
     add_state_option(fleet_status)
+
+    # 批次灰度推进与自动故障回滚（canary）：独立命令组，不改变既有入口语义。
+    canary = subparsers.add_parser("canary", help="批次灰度发布与自动故障回滚")
+    canary_sub = canary.add_subparsers(dest="canary_command")
+
+    firmware_add = canary_sub.add_parser("firmware-add", help="登记可用固件版本")
+    firmware_add.add_argument("--version", required=True)
+    firmware_add.set_defaults(handler=canary_cmd_firmware_add, mutating=True)
+    add_state_option(firmware_add)
+
+    batch_create = canary_sub.add_parser("batch-create", help="创建批次灰度发布")
+    batch_create.add_argument("--batch-id", required=True)
+    batch_create.add_argument("--target-version", required=True)
+    batch_create.add_argument("--stable-version", required=True)
+    batch_create.add_argument("--device-id", action="append", default=[],
+                              help="目标设备，可重复")
+    batch_create.add_argument("--batch-size", required=True)
+    batch_create.add_argument("--failure-threshold", required=True,
+                              help="可继续推进的失败率阈值，严格大于 0 且小于 1（如 0.2）")
+    batch_create.add_argument("--heartbeat-timeout-seconds", required=True)
+    batch_create.set_defaults(handler=canary_cmd_batch_create, mutating=True)
+    add_state_option(batch_create)
+
+    batch_start = canary_sub.add_parser("start", help="开始批次发布并下发首批")
+    batch_start.add_argument("--batch-id", required=True)
+    batch_start.set_defaults(handler=canary_cmd_batch_start, mutating=True)
+    add_state_option(batch_start)
+
+    batch_check = canary_sub.add_parser("check", help="按给定时刻收批心跳超时设备")
+    batch_check.add_argument("--batch-id", required=True)
+    batch_check.add_argument("--at", required=True, help="判定时刻（ISO 8601）")
+    batch_check.set_defaults(handler=canary_cmd_batch_check, mutating=True)
+    add_state_option(batch_check)
+
+    batch_status = canary_sub.add_parser("status", help="查看批次灰度发布状态")
+    batch_status.add_argument("--batch-id", required=True)
+    batch_status.set_defaults(handler=canary_cmd_batch_status, mutating=False)
+    add_state_option(batch_status)
 
     return parser
 
