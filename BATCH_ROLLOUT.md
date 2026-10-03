@@ -48,6 +48,10 @@ python -m ota_canary batch rollback-report --batch-id B1 --device-id d1 \
 
 # 只读状态查询
 python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
+
+# 只读审计时间线（分页：after-sequence + limit）
+python -m ota_canary batch timeline --batch-id B1 \
+    [--after-sequence 0] [--limit 200]
 ```
 
 ## 创建校验（异常唯一）
@@ -137,3 +141,63 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 - 自动停止后 `frozen=true`：后续批次及未取得终态的设备再上报返回 `InvalidState`，
   不再接收升级任务。
 - 回滚结果同样以首次为准：`pending` 之外重复相同结果幂等返回，冲突结果 `InvalidArgument`。
+
+## 审计时间线（batch timeline，只读）
+
+批次发布在既有状态结构中新增仅追加的 `timeline` 事件流，通过只读入口查询：
+
+```bash
+python -m ota_canary batch timeline --batch-id B1 \
+    [--after-sequence 0] [--limit 200] [--state 文件]
+```
+
+- 输出 `batchId`、`nextSequence`、`events`；`events` 按 `sequence` 升序，
+  且均严格大于 `--after-sequence`，按最早顺序取 `--limit` 条。
+- `--after-sequence` 默认 `0`，须为非负整数；`--limit` 默认 `200`，
+  须为 `1` 到 `1000` 的整数。`nextSequence` 在无事件返回时为 `1`，
+  否则为本页最大 `sequence + 1`，可直接作为下一页的 `--after-sequence`。
+- 只读：任何情况下不写状态文件；批次不存在返回 `DeviceNotFound`，
+  `--after-sequence` 或 `--limit` 非法返回 `InvalidArgument`
+  （stderr JSON、非零退出、不改状态）。
+- 旧状态没有时间线：不补历史，返回 `events: []`、`nextSequence: 1`，
+  且查询本身不落盘；既有各状态批次均可查、重复查询结果稳定。
+- 与 `releases` 隔离：审计事件只挂在 `batchRollouts` 内，`--state` 语义不变。
+
+### 事件字段
+
+每个事件固定包含：`sequence`（从 1 开始严格递增）、`type`、`occurredAt`
+（显式 `--at`、调用时刻或心跳时刻换算后的 ISO 8601 UTC `Z` 值）、
+`batchIndex`、`deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason`；
+未涉及的值一律为 `null`。
+
+### 事件类型与追加时机
+
+仅在 `batch create|start|report|check|abort|rollback-report` **成功**后追加；
+命令失败、幂等重复、冲突或迟到结果沿用既有异常返回且**不追加**；
+任何事件一经写入永不修改。
+
+| type | 时机 | 关键字段 |
+| --- | --- | --- |
+| `created` | create 成功 | 其余均 null（occurredAt 为调用时刻） |
+| `started` | start 成功 | occurredAt=`--at`/调用时刻 |
+| `batch_opened` | 首批打开与每批推进时 | `batchIndex` |
+| `upgrade_reported` | report 成功（含仅心跳） | `deviceId`、`batchIndex`、`result`（仅心跳为 null）、`phaseFrom`/`phaseTo`（相位未变化时为 null） |
+| `timeout_recorded` | check 每判出一台超时设备 | `deviceId`、`batchIndex`、`result="failure"`、`phaseFrom`（`pending_upgrade`/`upgrading`）、`phaseTo="failed"` |
+| `batch_advanced` | 本批集齐且未超阈值、推进下一批前 | `batchIndex`（刚集齐的批次） |
+| `stopped` | 自动停止或人工止损成立 | `reason`：自动停止为 `failure_threshold`，人工为止损为 `manual_abort` |
+| `aborted` | abort 成功（紧跟 `stopped`） | `reason`=去除首尾空白后的 `--reason` |
+| `rollback_started` | 每台已成功设备收到回滚任务 | `deviceId`、`batchIndex`、`phaseFrom="success"`、`phaseTo="rolling_back"`；按 `(batchIndex, deviceId)` 升序 |
+| `rollback_reported` | rollback-report 首次成功 | `deviceId`、`batchIndex`、`result`、`phaseFrom="rolling_back"`、`phaseTo="rollback_succeeded"/"rollback_failed"` |
+| `finished` | 进入终态：`completed`/`rolled_back`/`rollback_failed` | `reason` 取 `completed`、`rolled_back`、`rollback_failed` |
+
+说明：
+
+- 事件排序按同一次状态迁移内的固定次序：如自动停止为
+  `timeout_recorded`(s) → `stopped` → `rollback_started`(s)；人工止损为
+  `stopped` → `aborted` → `rollback_started`(s)；回滚任务全部收束为
+  `rollback_reported`(末次) → `finished`；全部批次完成为
+  `batch_advanced`/`batch_opened` 序列后的 `finished(reason=completed)`。
+- 幂等重复（相同终态/回滚结果）与冲突、晚到（如失败后报成功、
+  `pending` 之外报不同回滚结果）、停止后再报、非 `in_progress` 再 abort、
+  资格不合格的 start、编号冲突的 create 等均不产生事件。
+- 公开入口 `device heartbeat` 的旁路喂心跳不产生审计事件。
