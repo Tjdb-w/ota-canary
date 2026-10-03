@@ -43,6 +43,10 @@ python -m ota_canary batch check --batch-id B1 --at 2026-10-01T10:00:00Z
 python -m ota_canary batch abort --batch-id B1 \
     --reason 人工止损 --at 2026-10-01T10:00:00Z
 
+# 临时暂停 / 恢复：冻结当前批推进，恢复后从原批次继续（暂停时长不计入计时）
+python -m ota_canary batch pause --batch-id B1 --at 2026-10-01T09:30:00Z
+python -m ota_canary batch resume --batch-id B1 --at 2026-10-01T11:00:00Z
+
 # 自动停止或人工止损后回传每台设备的回滚结果（回滚到 stable-version）
 python -m ota_canary batch rollback-report --batch-id B1 --device-id d1 \
     --result success --version 1.0.0 --heartbeat-at 2026-10-01T10:10:00Z
@@ -123,14 +127,37 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   没有需要回滚的设备时直接 `rolled_back`。未超阈值时：观察期为 0 立即推进下一批，
   全部完成 → `completed`；观察期大于 0 时先进入稳定观察期（见下节），
   由 `batch check --at` 严格晚于截止时刻后推进或完成。
-- `batch abort` 是人工止损入口，仅接受 `in_progress` 批次（含稳定观察期内）：立即冻结
-  后续批次、拒绝新的升级报告，**成功时清空 `stabilizationDeadline`**，
-  `stopReason` 固定为 `manual_abort`，并向**已成功**设备下发回滚到
-  `stableVersion` 的任务（失败、超时、排队和未取得终态设备不生成任务）。尚有回滚
-  任务时先保持 `failed_stopped`；全部成功或无任务时最终 `rolled_back`，任一失败则
-  `rollback_failed`，收束规则与自动停止完全一致。批次不存在返回 `DeviceNotFound`；
-  对 `pending`、`failed_stopped`、`completed`、`rolled_back`、`rollback_failed`
-  执行 abort 返回 `InvalidState`。
+- `batch abort` 是人工止损入口，仅接受 `in_progress` 或 `paused` 批次（含稳定
+  观察期内）：立即冻结后续批次、拒绝新的升级报告，**成功时清空
+  `stabilizationDeadline`**，`stopReason` 固定为 `manual_abort`，并向**已成功**
+  设备下发回滚到 `stableVersion` 的任务（失败、超时、排队和未取得终态设备不生成
+  任务）。尚有回滚任务时先保持 `failed_stopped`；全部成功或无任务时最终
+  `rolled_back`，任一失败则 `rollback_failed`，收束规则与自动停止完全一致。
+  批次不存在返回 `DeviceNotFound`；对 `pending`、`failed_stopped`、`completed`、
+  `rolled_back`、`rollback_failed` 执行 abort 返回 `InvalidState`。
+
+## 临时暂停与恢复（batch pause / batch resume）
+
+- `batch pause --batch-id B1 --at <时刻>` 仅接受 `in_progress` 批次：成功后状态为
+  `paused` 并记录 `pausedAt`（`--at` 换算为 UTC 后的 `Z` 时间）。`batch resume`
+  仅接受 `paused` 批次：成功后回到 `in_progress` 并记录 `resumedAt`。两者都原样
+  保留批次划分、当前批、报告、设备版本心跳、回滚数据与策略，恢复后从原批次继续。
+- `batch status` 顶层含 `paused`（当前是否处于暂停）、`pausedAt`、`resumedAt`；
+  从未暂停（含缺少暂停字段的旧状态）时为 `false`、`null`、`null`，只读查询不补写。
+- 暂停期间 `batch report` 与 `batch check` 返回 `InvalidState`：不写报告、不补
+  超时、不推进；`batch abort` 接受 `paused`，仍按 `manual_abort` 派发回滚并沿用
+  `rollback_failed` 收束；`device heartbeat` 的既有结果不变，可更新公开设备和
+  当前批心跳，但不改变设备阶段或生成终态。
+- 暂停时长（`resumedAt - pausedAt`）不计入心跳超时与稳定观察计时：恢复时把未
+  清空的 `stabilizationDeadline` 顺延暂停时长，心跳超时判定同样扣除暂停区间；
+  恢复后沿用原批次和策略，越过截止时刻仍由 `batch check` 显式推进。
+- `pause` 与 `resume` 成功时输出带暂停字段的 `batch status` 视图，并向时间线
+  追加 `type=paused` / `type=resumed` 事件（`occurredAt` 取 `--at`）；失败不追加。
+- 错误：批次不存在返回 `DeviceNotFound`；`--at` 非法返回 `InvalidArgument`；
+  对非 `in_progress` 执行 pause、对非 `paused` 执行 resume 返回 `InvalidState`。
+  所有校验通过前不写入任何状态：错误走 stderr JSON、非零退出且不修改状态文件。
+- 暂停中的批次仍占用其目标设备：其他发布的 `batch plan`/`batch start` 资格预检
+  把这些设备视为 `DEVICE_BUSY`。
 
 ## 人工止损字段与校验
 
@@ -153,6 +180,8 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 无终态时为 `null`）、`currentBatch`、`frozen`（后续批次是否已冻结）、
 `stabilizationSeconds`（策略值，旧状态显示 `0`）、`stabilizationDeadline`
 （仅稳定观察期截止时刻非空；观察期外与旧状态均为 `null`，只读查询不补写）、
+`paused`、`pausedAt`、`resumedAt`（暂停字段，从未暂停或旧状态为
+`false`、`null`、`null`）、
 `phaseCounts`、
 回滚计数（`rollbackTotal/Pending/Succeeded/Failed`）与逐设备 `devices[]`。
 `status` 只读，不补写超时结果；超过心跳超时但尚未 `check` 的设备显示
@@ -170,14 +199,15 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 ## 审计时间线（batch timeline，只读）
 
-`batch create`、`start`、`report`、`check`、`abort`、`rollback-report` 成功后向批次
+`batch create`、`start`、`report`、`check`、`abort`、`rollback-report`、
+`pause`、`resume` 成功后向批次
 追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态均不追加，历史事件只增不改。
 事件字段：`sequence`（从 1 起严格递增）、`type`、`occurredAt`、`batchIndex`、
 `deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason`，未涉及的字段为 `null`。
 
 - `type` 取值：`created`、`started`、`batch_opened`、`upgrade_reported`、
   `timeout_recorded`、`batch_advanced`、`stopped`、`rollback_started`、
-  `rollback_reported`、`aborted`、`finished`。
+  `rollback_reported`、`aborted`、`paused`、`resumed`、`finished`。
 - `occurredAt` 取显式 `--at`、调用时刻或心跳时刻，统一为 ISO 8601 UTC `Z` 后缀。
 - `batch check` 越过观察期截止时刻推进下一批时追加 `batch_advanced`，末批完成时
   追加 `finished`，`occurredAt` 取该次 `--at`；观察期内未越过截止时刻、且未补出

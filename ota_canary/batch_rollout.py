@@ -16,10 +16,14 @@
 - 本批失败率严格大于阈值时自动 FAILED_STOPPED、冻结后续批次，并向已成功升级的
   设备下发回滚到稳定版本的任务，逐台记录 PENDING/成功/失败，最终 ROLLED_BACK
   或 ROLLBACK_FAILED；
-- 人工止损 ``batch abort`` 仅在 IN_PROGRESS 时可用：立即冻结后续批次、拒绝新的
-  升级报告，并向已成功设备下发同样的回滚任务，收束口径与自动停止一致。
-- 审计时间线：create/start/report/check/abort/rollback-report 成功后向批次追加
-  严格递增事件（失败、幂等重复、冲突/迟到不追加，历史只增不改），
+- 人工止损 ``batch abort`` 在 IN_PROGRESS 或 PAUSED 时可用：立即冻结后续批次、
+  拒绝新的升级报告，并向已成功设备下发同样的回滚任务，收束口径与自动停止一致。
+- 临时暂停与恢复：``batch pause`` 仅接受 in_progress，置为 paused 并记录
+  pausedAt；``batch resume`` 仅接受 paused，回到 in_progress 并记录 resumedAt。
+  暂停期间 report/check 返回 InvalidState，abort 仍可按 manual_abort 止损；
+  暂停时长不计入心跳超时与稳定观察计时，恢复后 stabilizationDeadline 相应顺延。
+- 审计时间线：create/start/report/check/abort/rollback-report/pause/resume
+  成功后向批次追加严格递增事件（失败、幂等重复、冲突/迟到不追加，历史只增不改），
   ``batch timeline`` 只读查询，支持 --after-sequence 与 --limit 分页。
 
 仅使用 Python 3 标准库。
@@ -67,6 +71,7 @@ REASON_DEVICE_BUSY = "DEVICE_BUSY"
 # 批次发布状态
 STATUS_PENDING = "pending"
 STATUS_IN_PROGRESS = "in_progress"
+STATUS_PAUSED = "paused"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED_STOPPED = "failed_stopped"
 STATUS_ROLLED_BACK = "rolled_back"
@@ -85,9 +90,9 @@ PHASE_ROLLBACK_FAILED = "rollback_failed"            # 回滚失败
 
 TERMINAL_PHASES = (PHASE_SUCCESS, PHASE_FAILED)
 
-# 占用设备的发布状态：仅 in_progress 与 failed_stopped 占用；
+# 占用设备的发布状态：in_progress、paused 与 failed_stopped 占用；
 # completed、rolled_back、rollback_failed 均释放。
-OCCUPYING_STATUSES = (STATUS_IN_PROGRESS, STATUS_FAILED_STOPPED)
+OCCUPYING_STATUSES = (STATUS_IN_PROGRESS, STATUS_PAUSED, STATUS_FAILED_STOPPED)
 
 # 审计时间线事件类型
 EVENT_CREATED = "created"
@@ -100,6 +105,8 @@ EVENT_STOPPED = "stopped"
 EVENT_ROLLBACK_STARTED = "rollback_started"
 EVENT_ROLLBACK_REPORTED = "rollback_reported"
 EVENT_ABORTED = "aborted"
+EVENT_PAUSED = "paused"
+EVENT_RESUMED = "resumed"
 EVENT_FINISHED = "finished"
 
 # 自动停止事件的 reason（人工中止事件取修剪后的 --reason）
@@ -323,6 +330,9 @@ def cmd_batch_create(state, args):
         "stopReason": None,
         "abortReason": None,
         "abortedAt": None,
+        "pausedAt": None,
+        "resumedAt": None,
+        "pauseIntervals": [],
         "batches": [],
         "currentBatch": None,
         "currentBatchStartedAt": None,
@@ -340,7 +350,7 @@ def cmd_batch_create(state, args):
 # ---------------------------------------------------------------------------
 
 def occupied_device_ids(state, rollout):
-    """其他仍占用设备的发布：仅 in_progress 与 failed_stopped。
+    """其他仍占用设备的发布：in_progress、paused 与 failed_stopped。
 
     completed、rolled_back、rollback_failed 释放占用；pending 发布尚未建批，
     也不占用。占用集合取占用发布创建时确定的去重目标设备集。
@@ -475,6 +485,38 @@ def heartbeat_anchor(rollout, entry):
     return cli.parse_time(text) if text else None
 
 
+def paused_overlap(rollout, anchor, at_instant):
+    """[anchor, at_instant] 与已收束暂停区间的重叠时长（暂停时长不计入计时）。
+
+    暂停期间 report/check 均被拒绝、device heartbeat 也不喂给非 in_progress 批次，
+    因此锚点不会落在暂停区间内；这里仍按一般重叠计算，多次暂停各自扣除。
+    旧状态没有 pauseIntervals 时按空列表处理。
+    """
+    intervals = rollout.get("pauseIntervals")
+    if not isinstance(intervals, list):
+        return timedelta(0)
+    paused = timedelta(0)
+    for interval in intervals:
+        if not isinstance(interval, dict):
+            continue
+        paused_at = interval.get("pausedAt")
+        resumed_at = interval.get("resumedAt")
+        if not paused_at or not resumed_at:
+            continue
+        start = cli.parse_time(paused_at)
+        end = cli.parse_time(resumed_at)
+        overlap_start = max(anchor, start)
+        overlap_end = min(at_instant, end)
+        if overlap_end > overlap_start:
+            paused += overlap_end - overlap_start
+    return paused
+
+
+def heartbeat_expired(rollout, anchor, at_instant, timeout):
+    """超时判定：at 严格晚于 锚点 + 超时，且锚点与 at 之间的暂停时长不计入。"""
+    return at_instant - paused_overlap(rollout, anchor, at_instant) > anchor + timeout
+
+
 def record_heartbeat(state, rollout, device_id, version, heartbeat_text, at_instant):
     """登记一次有效心跳：同步公开设备入口的版本/心跳，并推进待升级->升级中。"""
     device = state["devices"].get(device_id)
@@ -586,9 +628,9 @@ def cmd_batch_check(state, args):
         anchor = heartbeat_anchor(rollout, entry)
         if anchor is None:
             continue
-        if at_instant > anchor + timeout:
+        if heartbeat_expired(rollout, anchor, at_instant, timeout):
             # 等待升级终态期间超过心跳超时仍未收到有效心跳 -> 本批失败。
-            # heartbeatAt 保留设备原值，显式结果永不覆盖。
+            # 暂停时长不计入；heartbeatAt 保留设备原值，显式结果永不覆盖。
             phase_before = entry["phase"]
             entry["phase"] = PHASE_FAILED
             entry["terminal"] = {
@@ -726,7 +768,7 @@ def trigger_failure_stop(state, rollout, at_instant):
 
 
 def cmd_batch_abort(state, args):
-    """人工止损：仅进行中的批次可中止，固定 manual_abort。
+    """人工止损：进行中或已暂停的批次可中止，固定 manual_abort。
 
     所有参数与状态校验（含批次存在性与当前状态）通过前不写入任何状态。
     """
@@ -734,12 +776,12 @@ def cmd_batch_abort(state, args):
     reason = cli.require_abort_reason(args.reason)
     _, at_instant = cli.require_time(args.at)
     rollout = get_rollout(state, batch_id)
-    if rollout["status"] != STATUS_IN_PROGRESS:
+    if rollout["status"] not in (STATUS_IN_PROGRESS, STATUS_PAUSED):
         raise cli.InvalidState(
             "batch %s cannot be aborted (status: %s)" % (batch_id, rollout["status"])
         )
     append_event(rollout, EVENT_ABORTED, at_instant,
-                 phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_FAILED_STOPPED,
+                 phase_from=rollout["status"], phase_to=STATUS_FAILED_STOPPED,
                  reason=reason)
     freeze_and_dispatch_rollbacks(rollout, "manual_abort", at_instant)
     rollout["abortReason"] = reason
@@ -747,6 +789,65 @@ def cmd_batch_abort(state, args):
     # 尚有回滚任务时先保持 failed_stopped，由 rollback-report 收束；无任务时直接
     # 收束为 rolled_back（abort 响应本身已保证停止状态外部可见）。
     finalize_rollback_if_done(rollout, converge_empty=True, at_instant=at_instant)
+    return batch_view(state, rollout, at_instant=at_instant)
+
+
+# ---------------------------------------------------------------------------
+# 临时暂停与恢复（冻结当前批推进，恢复后从原批次继续）
+# ---------------------------------------------------------------------------
+
+def cmd_batch_pause(state, args):
+    """临时暂停：仅进行中的批次可暂停，记录 pausedAt。
+
+    暂停只冻结推进：批次划分、当前批、报告、设备版本心跳、回滚数据与策略全部
+    保留。所有参数与状态校验通过前不写入任何状态。
+    """
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    _, at_instant = cli.require_time(args.at)
+    rollout = get_rollout(state, batch_id)
+    if rollout["status"] != STATUS_IN_PROGRESS:
+        raise cli.InvalidState(
+            "batch %s cannot be paused (status: %s)" % (batch_id, rollout["status"])
+        )
+    rollout["status"] = STATUS_PAUSED
+    rollout["pausedAt"] = cli.format_instant(at_instant)
+    append_event(rollout, EVENT_PAUSED, at_instant,
+                 phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_PAUSED)
+    return batch_view(state, rollout, at_instant=at_instant)
+
+
+def cmd_batch_resume(state, args):
+    """恢复暂停：仅已暂停的批次可恢复，记录 resumedAt 并顺延观察截止时刻。
+
+    暂停时长（resumedAt - pausedAt）不计入心跳超时与稳定观察计时：恢复时把
+    未清空的 stabilizationDeadline 顺延相同时长，心跳超时判定则通过
+    pauseIntervals 在比较时扣除。恢复后沿用原批次与策略，越过截止仍由
+    batch check 显式推进。所有校验通过前不写入任何状态。
+    """
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    _, at_instant = cli.require_time(args.at)
+    rollout = get_rollout(state, batch_id)
+    if rollout["status"] != STATUS_PAUSED:
+        raise cli.InvalidState(
+            "batch %s cannot be resumed (status: %s)" % (batch_id, rollout["status"])
+        )
+    paused_text = rollout.get("pausedAt")
+    paused_instant = cli.parse_time(paused_text) if paused_text else None
+    rollout["status"] = STATUS_IN_PROGRESS
+    rollout["resumedAt"] = cli.format_instant(at_instant)
+    intervals = rollout.get("pauseIntervals")
+    if not isinstance(intervals, list):
+        intervals = []
+        rollout["pauseIntervals"] = intervals
+    intervals.append({"pausedAt": paused_text, "resumedAt": rollout["resumedAt"]})
+    if paused_instant is not None and rollout.get("stabilizationDeadline") is not None:
+        # 稳定观察计时扣除暂停时长：截止时刻顺延暂停时长。
+        deadline = cli.parse_time(rollout["stabilizationDeadline"])
+        rollout["stabilizationDeadline"] = cli.format_instant(
+            deadline + (at_instant - paused_instant)
+        )
+    append_event(rollout, EVENT_RESUMED, at_instant,
+                 phase_from=STATUS_PAUSED, phase_to=STATUS_IN_PROGRESS)
     return batch_view(state, rollout, at_instant=at_instant)
 
 
@@ -849,8 +950,8 @@ def effective_phase(rollout, entry, at_instant):
         return PHASE_QUEUED
     anchor = heartbeat_anchor(rollout, entry)
     timeout = timedelta(seconds=rollout["heartbeatTimeoutSeconds"])
-    if anchor is not None and at_instant > anchor + timeout:
-        # 未取得终态且已无有效心跳：等待心跳（check 后才会落为 failed）。
+    if anchor is not None and heartbeat_expired(rollout, anchor, at_instant, timeout):
+        # 未取得终态且已无有效心跳（暂停时长不计入）：等待心跳（check 后才会落为 failed）。
         return PHASE_WAITING_HEARTBEAT
     return PHASE_UPGRADING if entry.get("lastHeartbeatAt") else PHASE_PENDING_UPGRADE
 
@@ -930,6 +1031,10 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
         "stopReason": rollout.get("stopReason"),
         "abortReason": rollout.get("abortReason"),
         "abortedAt": rollout.get("abortedAt"),
+        # 暂停字段：旧状态缺少时按从未暂停读取（false、null、null），不补写历史。
+        "paused": rollout["status"] == STATUS_PAUSED,
+        "pausedAt": rollout.get("pausedAt"),
+        "resumedAt": rollout.get("resumedAt"),
         "currentBatch": rollout["currentBatch"],
         "currentBatchStartedAt": rollout.get("currentBatchStartedAt"),
         "batchCount": len(rollout["batches"]),
@@ -1144,6 +1249,18 @@ def register_parsers(subparsers, add_state_option):
     batch_abort.add_argument("--at", required=True, help="止损时刻（ISO 8601）")
     batch_abort.set_defaults(handler=cmd_batch_abort, mutating=True)
     add_state_option(batch_abort)
+
+    batch_pause = batch_sub.add_parser("pause", help="临时暂停进行中的批次发布")
+    batch_pause.add_argument("--batch-id", required=True)
+    batch_pause.add_argument("--at", required=True, help="暂停时刻（ISO 8601）")
+    batch_pause.set_defaults(handler=cmd_batch_pause, mutating=True)
+    add_state_option(batch_pause)
+
+    batch_resume = batch_sub.add_parser("resume", help="恢复已暂停的批次发布")
+    batch_resume.add_argument("--batch-id", required=True)
+    batch_resume.add_argument("--at", required=True, help="恢复时刻（ISO 8601）")
+    batch_resume.set_defaults(handler=cmd_batch_resume, mutating=True)
+    add_state_option(batch_resume)
 
     batch_rollback = batch_sub.add_parser(
         "rollback-report", help="回传回滚到稳定版本任务的结果")
