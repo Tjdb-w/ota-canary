@@ -39,7 +39,12 @@ python -m ota_canary device heartbeat --device-id d2 --version 2.0.0 \
 # 按给定时刻收批：超过心跳超时仍未取得终态的设备记 failure(reason=timeout)
 python -m ota_canary batch check --batch-id B1 --at 2026-10-01T10:00:00Z
 
+# 临时暂停 / 恢复：冻结当前批推进后从原批次继续
+python -m ota_canary batch pause --batch-id B1 --at 2026-10-01T09:30:00Z
+python -m ota_canary batch resume --batch-id B1 --at 2026-10-01T09:45:00Z
+
 # 人工止损：冻结后续批次、拒绝新的升级报告，并向已成功设备下发回滚任务
+# （in_progress 与 paused 批次均可中止）
 python -m ota_canary batch abort --batch-id B1 \
     --reason 人工止损 --at 2026-10-01T10:00:00Z
 
@@ -94,8 +99,8 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   `eligibleDeviceIds`、`ineligibleDevices`、`candidateCount`、`batches`。
 - `targetDeviceIds` 取创建时去重集合并按 device-id 升序。
 - 合格条件：设备当前版本等于 `stableVersion`，且未被**其他**处于
-  `in_progress` 或 `failed_stopped` 的发布占用；`completed`、`rolled_back`、
-  `rollback_failed` 释放占用，`pending` 发布尚未建批也不占用。
+  `in_progress`、`paused` 或 `failed_stopped` 的发布占用；`completed`、
+  `rolled_back`、`rollback_failed` 释放占用，`pending` 发布尚未建批也不占用。
 - `ineligibleDevices` 按 device-id 升序给出 `{deviceId, reason}`，每台设备唯一原因：
   版本不符为 `VERSION_MISMATCH`，被占用为 `DEVICE_BUSY`；两者兼有时
   `VERSION_MISMATCH` 优先。
@@ -123,14 +128,47 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   没有需要回滚的设备时直接 `rolled_back`。未超阈值时：观察期为 0 立即推进下一批，
   全部完成 → `completed`；观察期大于 0 时先进入稳定观察期（见下节），
   由 `batch check --at` 严格晚于截止时刻后推进或完成。
-- `batch abort` 是人工止损入口，仅接受 `in_progress` 批次（含稳定观察期内）：立即冻结
-  后续批次、拒绝新的升级报告，**成功时清空 `stabilizationDeadline`**，
+- `batch abort` 是人工止损入口，接受 `in_progress`（含稳定观察期内）与 `paused`
+  批次：立即冻结后续批次、拒绝新的升级报告，**成功时清空 `stabilizationDeadline`**，
   `stopReason` 固定为 `manual_abort`，并向**已成功**设备下发回滚到
   `stableVersion` 的任务（失败、超时、排队和未取得终态设备不生成任务）。尚有回滚
   任务时先保持 `failed_stopped`；全部成功或无任务时最终 `rolled_back`，任一失败则
   `rollback_failed`，收束规则与自动停止完全一致。批次不存在返回 `DeviceNotFound`；
   对 `pending`、`failed_stopped`、`completed`、`rolled_back`、`rollback_failed`
-  执行 abort 返回 `InvalidState`。
+  执行 abort 返回 `InvalidState`。从 `paused` 止损时时间线 `aborted` 事件的
+  `phaseFrom=paused`。
+
+## 临时暂停与恢复（batch pause / batch resume）
+
+- `batch pause --batch-id B1 --at <ISO 8601>` 仅接受 `in_progress` 批次：
+  成功后 `status=paused`，记录 `pausedAt`（`--at` 换算 UTC 后的 `Z` 时间），
+  并把 `resumedAt` 置空。`batch resume --batch-id B1 --at <ISO 8601>` 仅接受
+  `paused` 批次：成功后回到 `in_progress`，记录 `resumedAt`。
+- 批次划分（`batches`）、`currentBatch`、终态报告、设备版本与心跳、回滚数据、
+  阈值/超时/观察策略全部原样保留，恢复后从原批次继续。
+- 暂停期间 `batch report` 与 `batch check` 返回 `InvalidState`：不写报告、
+  不补超时、不推进批次。`batch status` 与 `batch timeline` 仍可只读查询；
+  `device heartbeat` 的既有结果不变：可更新公开设备与当前批心跳，但不改变
+  设备阶段、不生成终态。
+- **暂停时长不计入心跳超时**：恢复后 `batch check` 的超时判定按
+  `at - 暂停重叠时长 > 最近有效心跳 + heartbeat-timeout-seconds` 计算，
+  只读 `status` 的 `waiting_heartbeat` 判定同口径。
+- **暂停时长不计入稳定观察计时**：暂停时若已存在 `stabilizationDeadline`，
+  `resume` 时按本段暂停时长顺延截止时刻；暂停发生在进入观察期之前时，截止时刻
+  在进入观察期时统一扣除暂停时长。恢复后越过新截止时刻仍须由显式
+  `batch check --at` 推进，截止时刻过后未 check 不自动推进。
+- `batch abort` 接受 `paused`，仍按 `manual_abort` 派发回滚并沿用
+  `rollback_failed`/`rolled_back` 收束。
+- `pause`/`resume` 成功时输出带暂停字段的 `batch status` 视图，并向时间线追加
+  `type=paused` / `type=resumed` 事件（`phaseFrom`/`phaseTo` 分别为
+  `in_progress→paused`、`paused→in_progress`）；失败不追加。
+- 错误：批次不存在返回 `DeviceNotFound`；`--at` 非法返回 `InvalidArgument`；
+  对非 `in_progress`（含 `paused`、`pending`、各终态）执行 `pause`、对非
+  `paused` 执行 `resume` 返回 `InvalidState`。所有校验通过后才写状态：
+  错误走 stderr JSON、非零退出且不修改状态文件。
+- 可重复暂停/恢复；每次成功追加一对事件。旧状态缺少暂停字段时按从未暂停读取
+  （`paused=false`、`pausedAt=null`、`resumedAt=null`），时间线沿用
+  `nextSequence` 继续追加。
 
 ## 人工止损字段与校验
 
@@ -151,6 +189,8 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 `batch status` 顶层还返回：`completedCount`、`failedCount`、`reportedCount`、
 `currentBatchReportedCount`、`failureRate`（当前推进批次已取得终态设备中的失败占比，
 无终态时为 `null`）、`currentBatch`、`frozen`（后续批次是否已冻结）、
+`paused`（当前是否处于暂停）、`pausedAt`/`resumedAt`（最近一次暂停/恢复时刻，
+从未暂停或对应动作未发生时为 `null`；再次暂停会把 `resumedAt` 重新置空）、
 `stabilizationSeconds`（策略值，旧状态显示 `0`）、`stabilizationDeadline`
 （仅稳定观察期截止时刻非空；观察期外与旧状态均为 `null`，只读查询不补写）、
 `phaseCounts`、
@@ -170,14 +210,15 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 ## 审计时间线（batch timeline，只读）
 
-`batch create`、`start`、`report`、`check`、`abort`、`rollback-report` 成功后向批次
-追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态均不追加，历史事件只增不改。
+`batch create`、`start`、`report`、`check`、`abort`、`rollback-report`、`pause`、
+`resume` 成功后向批次追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态
+均不追加，历史事件只增不改。
 事件字段：`sequence`（从 1 起严格递增）、`type`、`occurredAt`、`batchIndex`、
 `deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason`，未涉及的字段为 `null`。
 
 - `type` 取值：`created`、`started`、`batch_opened`、`upgrade_reported`、
   `timeout_recorded`、`batch_advanced`、`stopped`、`rollback_started`、
-  `rollback_reported`、`aborted`、`finished`。
+  `rollback_reported`、`aborted`、`paused`、`resumed`、`finished`。
 - `occurredAt` 取显式 `--at`、调用时刻或心跳时刻，统一为 ISO 8601 UTC `Z` 后缀。
 - `batch check` 越过观察期截止时刻推进下一批时追加 `batch_advanced`，末批完成时
   追加 `finished`，`occurredAt` 取该次 `--at`；观察期内未越过截止时刻、且未补出
