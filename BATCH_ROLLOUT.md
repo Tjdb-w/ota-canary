@@ -18,6 +18,7 @@ python -m ota_canary firmware list
 python -m ota_canary batch create \
     --batch-id B1 --target-version 2.0.0 --stable-version 1.0.0 \
     --batch-size 2 --failure-threshold 0.5 --heartbeat-timeout-seconds 900 \
+    --stabilization-seconds 300 \
     --target-device-id d1 --target-device-id d2 --target-device-id d3
 
 # 开始放量：仅把第一批设备置为 pending_upgrade
@@ -59,9 +60,31 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
    （固件存在指已 `firmware register`，或已有设备当前运行该版本）
 3. 设备集合为空（未提供 `--target-device-id`）→ `EmptyDeviceSet`
 4. 每批数量不是正整数、失败率阈值不满足严格 `0 < x < 1`、
-   心跳超时不大于 0 → `InvalidBatchPolicy`
+   心跳超时不大于 0、`stabilization-seconds` 为非整数或负数 → `InvalidBatchPolicy`
 5. 版本号格式非法、设备 ID 空/重复、设备未登记等参数问题沿用既有 `InvalidArgument`
    与 `DeviceNotFound`。
+
+`--stabilization-seconds` 可选，为大于等于 0 的整数，缺省 `0`；`0` 保持原有
+推进时机（整批终态集齐即推进/完成，与未引入观察期前完全一致），不影响
+`release create` 的同名参数。
+
+## 稳定观察期（stabilization-seconds > 0）
+
+- 本批全部取得终态后先判失败率：**严格大于** `failure-threshold` 时立即
+  `failed_stopped`、冻结并下发回滚，不进入观察；否则保持 `in_progress`、不开下一批，
+  并产生 `stabilizationDeadline`。
+- deadline 锚点取本批设备有效心跳（终态报告或仅心跳）`heartbeatAt` 的最大值；
+  整批均无有效心跳时取 `currentBatchStartedAt`；锚点再加 `stabilization-seconds`，
+  输出 ISO 8601 UTC `Z` 时间。
+- `batch check --at` 的处理顺序固定为：先补心跳超时（`failure`，`reason=timeout`），
+  再判失败率（超阈值立即停止回滚）；`stabilization-seconds` 为 `0` 立即推进，
+  大于 `0` 时 `--at` 必须**严格晚于** deadline 才推进下一批或 `completed`，
+  否则状态不变。deadline 过后未执行 check 不会自动推进；一次 check 同时补齐超时并
+  越过 deadline 即推进，重复 check 不重复推进。
+- `batch status` 返回 `stabilizationSeconds` 与 `stabilizationDeadline`；仅观察期内
+  deadline 非空，推进、完成、停止、回滚后清空；旧状态分别显示 `0` 和 `null`，不补写。
+- 越过 deadline 推进时 timeline 照常记录 `batch_advanced` 或 `finished`。
+- `batch abort` 立即冻结并下发回滚，成功时清空 deadline；终态幂等与冲突规则不变。
 
 ## 启动前资格预检（batch plan，只读）
 
@@ -126,7 +149,8 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 无终态时为 `null`）、`currentBatch`、`frozen`（后续批次是否已冻结）、`phaseCounts`、
 回滚计数（`rollbackTotal/Pending/Succeeded/Failed`）与逐设备 `devices[]`。
 `status` 只读，不补写超时结果；超过心跳超时但尚未 `check` 的设备显示
-`waiting_heartbeat`。
+`waiting_heartbeat`。顶层另返回 `stabilizationSeconds` 与
+`stabilizationDeadline`（仅观察期内非空，见「稳定观察期」）。
 
 ## 幂等与冻结
 
