@@ -137,3 +137,32 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 - 自动停止后 `frozen=true`：后续批次及未取得终态的设备再上报返回 `InvalidState`，
   不再接收升级任务。
 - 回滚结果同样以首次为准：`pending` 之外重复相同结果幂等返回，冲突结果 `InvalidArgument`。
+
+## 审计时间线（batch timeline，只读）
+
+`batch create`、`start`、`report`、`check`、`abort`、`rollback-report` 成功后向批次
+追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态均不追加，历史事件只增不改。
+事件字段：`sequence`（从 1 起严格递增）、`type`、`occurredAt`、`batchIndex`、
+`deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason`，未涉及的字段为 `null`。
+
+- `type` 取值：`created`、`started`、`batch_opened`、`upgrade_reported`、
+  `timeout_recorded`、`batch_advanced`、`stopped`、`rollback_started`、
+  `rollback_reported`、`aborted`、`finished`。
+- `occurredAt` 取显式 `--at`、调用时刻或心跳时刻，统一为 ISO 8601 UTC `Z` 后缀。
+- 自动停止事件 `stopped` 的 `reason=failure_threshold`；人工中止事件 `aborted`
+  的 `reason` 为去除首尾空白后的 `--reason`。
+
+```bash
+python -m ota_canary batch timeline --batch-id B1 [--after-sequence N] [--limit M]
+```
+
+- 输出 `batchId`、`nextSequence`、`events`；`events` 按 `sequence` 升序，
+  且均严格大于 `--after-sequence`（默认 0，须为非负整数）。
+- `--limit` 默认 200，须为 1 到 1000 的整数，取最早的条数。
+- `nextSequence` 为下一条事件的序号：无事件时为 1，否则为最大 `sequence` 加 1，
+  与 `--after-sequence`、`--limit` 无关。
+- 各批次状态均可查询，重复查询结果稳定；旧状态不补历史（`events` 为空、
+  `nextSequence=1`），后续成功命令从 1 起继续追加。
+- 批次不存在返回 `DeviceNotFound`；`--after-sequence`、`--limit` 非法返回
+  `InvalidArgument`；错误走 stderr JSON、非零退出且不修改状态文件。
+- 时间线独立于 `releases`，`--state` 用法与既有命令一致。

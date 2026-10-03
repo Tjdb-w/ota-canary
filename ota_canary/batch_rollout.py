@@ -15,6 +15,9 @@
   或 ROLLBACK_FAILED；
 - 人工止损 ``batch abort`` 仅在 IN_PROGRESS 时可用：立即冻结后续批次、拒绝新的
   升级报告，并向已成功设备下发同样的回滚任务，收束口径与自动停止一致。
+- 审计时间线：create/start/report/check/abort/rollback-report 成功后向批次追加
+  严格递增事件（失败、幂等重复、冲突/迟到不追加，历史只增不改），
+  ``batch timeline`` 只读查询，支持 --after-sequence 与 --limit 分页。
 
 仅使用 Python 3 标准库。
 """
@@ -82,6 +85,54 @@ TERMINAL_PHASES = (PHASE_SUCCESS, PHASE_FAILED)
 # 占用设备的发布状态：仅 in_progress 与 failed_stopped 占用；
 # completed、rolled_back、rollback_failed 均释放。
 OCCUPYING_STATUSES = (STATUS_IN_PROGRESS, STATUS_FAILED_STOPPED)
+
+# 审计时间线事件类型
+EVENT_CREATED = "created"
+EVENT_STARTED = "started"
+EVENT_BATCH_OPENED = "batch_opened"
+EVENT_UPGRADE_REPORTED = "upgrade_reported"
+EVENT_TIMEOUT_RECORDED = "timeout_recorded"
+EVENT_BATCH_ADVANCED = "batch_advanced"
+EVENT_STOPPED = "stopped"
+EVENT_ROLLBACK_STARTED = "rollback_started"
+EVENT_ROLLBACK_REPORTED = "rollback_reported"
+EVENT_ABORTED = "aborted"
+EVENT_FINISHED = "finished"
+
+# 自动停止事件的 reason（人工中止事件取修剪后的 --reason）
+STOP_REASON_FAILURE_THRESHOLD = "failure_threshold"
+
+# timeline 查询的默认与上限
+TIMELINE_DEFAULT_LIMIT = 200
+TIMELINE_MAX_LIMIT = 1000
+
+
+# ---------------------------------------------------------------------------
+# 审计时间线：成功命令追加严格递增事件，只增不改
+# ---------------------------------------------------------------------------
+
+def append_event(rollout, event_type, occurred_at, batch_index=None, device_id=None,
+                 result=None, phase_from=None, phase_to=None, reason=None):
+    """向批次追加一条审计事件；sequence 从 1 起严格递增，未涉及字段为 None。
+
+    仅在命令成功路径调用；失败、幂等重复、冲突/晚到均不追加。occurred_at 为
+    已校验的 UTC 瞬间（显式 --at、调用时刻或心跳时刻），统一格式化为 Z 后缀。
+    """
+    events = rollout.get("events")
+    if not isinstance(events, list):
+        events = []
+        rollout["events"] = events
+    events.append({
+        "sequence": len(events) + 1,
+        "type": event_type,
+        "occurredAt": cli.format_instant(occurred_at),
+        "batchIndex": batch_index,
+        "deviceId": device_id,
+        "result": result,
+        "phaseFrom": phase_from,
+        "phaseTo": phase_to,
+        "reason": reason,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +304,11 @@ def cmd_batch_create(state, args):
         "currentBatch": None,
         "currentBatchStartedAt": None,
         "devices": {},
+        "events": [],
     }
     rollouts(state)[batch_id] = rollout
+    # 创建成功：追加 created 事件（无显式时刻，取调用时刻）。
+    append_event(rollout, EVENT_CREATED, datetime.now(timezone.utc))
     return batch_view(state, rollout, at_instant=None)
 
 
@@ -373,6 +427,9 @@ def cmd_batch_start(state, args):
             }
     rollout["status"] = STATUS_IN_PROGRESS
     promote_batch(rollout, 0, at_instant)
+    append_event(rollout, EVENT_STARTED, at_instant,
+                 phase_from=STATUS_PENDING, phase_to=STATUS_IN_PROGRESS)
+    append_event(rollout, EVENT_BATCH_OPENED, at_instant, batch_index=0)
     return batch_view(state, rollout, at_instant=at_instant)
 
 
@@ -450,10 +507,14 @@ def cmd_batch_report(state, args):
         )
 
     # 心跳（无论是否携带终态）始终有效，但终态以首次为准。
+    phase_before = entry["phase"]
     record_heartbeat(state, rollout, device_id, version, heartbeat_text, at_instant)
 
     if result is None:
         # 仅心跳：保持升级中，等待终态。
+        append_event(rollout, EVENT_UPGRADE_REPORTED, at_instant,
+                     batch_index=entry["batchIndex"], device_id=device_id,
+                     phase_from=phase_before, phase_to=entry["phase"])
         return batch_view(state, rollout, at_instant=at_instant, reported_device=device_id,
                           result=None, heartbeat_at=heartbeat_text, version=version)
 
@@ -469,6 +530,9 @@ def cmd_batch_report(state, args):
         "heartbeatAt": heartbeat_text,
         "version": version,
     }
+    append_event(rollout, EVENT_UPGRADE_REPORTED, at_instant,
+                 batch_index=entry["batchIndex"], device_id=device_id, result=result,
+                 phase_from=phase_before, phase_to=entry["phase"])
     finalize_batch_if_ready(state, rollout, at_instant)
     return batch_view(state, rollout, at_instant=at_instant, reported_device=device_id,
                       result=result, heartbeat_at=heartbeat_text, version=version)
@@ -481,7 +545,7 @@ def cmd_batch_check(state, args):
     if rollout["status"] == STATUS_FAILED_STOPPED:
         # 无回滚任务的停止态在显式收批入口再次到达时收束为 rolled_back；
         # 仍有 pending 回滚任务时保持 failed_stopped，等待 rollback-report。
-        finalize_rollback_if_done(rollout, converge_empty=True)
+        finalize_rollback_if_done(rollout, converge_empty=True, at_instant=at_instant)
         view = batch_view(state, rollout, at_instant=at_instant)
         view["expiredDevices"] = []
         return view
@@ -502,6 +566,7 @@ def cmd_batch_check(state, args):
         if at_instant > anchor + timeout:
             # 等待升级终态期间超过心跳超时仍未收到有效心跳 -> 本批失败。
             # heartbeatAt 保留设备原值，显式结果永不覆盖。
+            phase_before = entry["phase"]
             entry["phase"] = PHASE_FAILED
             entry["terminal"] = {
                 "result": "failure",
@@ -509,6 +574,10 @@ def cmd_batch_check(state, args):
                 "heartbeatAt": entry.get("lastHeartbeatAt"),
                 "version": entry.get("lastVersion"),
             }
+            append_event(rollout, EVENT_TIMEOUT_RECORDED, at_instant,
+                         batch_index=current, device_id=device_id, result="failure",
+                         phase_from=phase_before, phase_to=PHASE_FAILED,
+                         reason="timeout")
             expired.append(device_id)
     expired.sort()
     finalize_batch_if_ready(state, rollout, at_instant)
@@ -528,39 +597,51 @@ def finalize_batch_if_ready(state, rollout, at_instant):
     rate = Fraction(failed, len(group))
     threshold = Fraction(Decimal(rollout["failureThreshold"]))
     if rate > threshold:
-        trigger_failure_stop(state, rollout)
+        trigger_failure_stop(state, rollout, at_instant)
         return
     if current + 1 == len(rollout["batches"]):
         rollout["status"] = STATUS_COMPLETED
         rollout["frozen"] = False
         rollout["currentBatchStartedAt"] = None
+        append_event(rollout, EVENT_FINISHED, at_instant,
+                     phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_COMPLETED)
     else:
         promote_batch(rollout, current + 1, at_instant)
+        append_event(rollout, EVENT_BATCH_ADVANCED, at_instant, batch_index=current + 1)
 
 
-def freeze_and_dispatch_rollbacks(rollout, stop_reason):
+def freeze_and_dispatch_rollbacks(rollout, stop_reason, at_instant):
     """冻结后续批次并向已成功设备下发回滚到 stableVersion 的任务。
 
     失败、超时、排队和未取得终态的设备不生成任务；设备阶段与终态报告保留现场。
+    每台收到回滚任务的设备追加一条 rollback_started 事件。
     """
     rollout["status"] = STATUS_FAILED_STOPPED
     rollout["frozen"] = True
     rollout["stopReason"] = stop_reason
     rollout["currentBatchStartedAt"] = None
-    for entry in rollout["devices"].values():
+    ordered = sorted(rollout["devices"].items(),
+                     key=lambda kv: (kv[1]["batchIndex"], kv[0]))
+    for device_id, entry in ordered:
         if entry["phase"] == PHASE_SUCCESS:
             entry["phase"] = PHASE_ROLLING_BACK
             entry["rollback"] = {"state": "pending", "heartbeatAt": None, "version": None}
+            append_event(rollout, EVENT_ROLLBACK_STARTED, at_instant,
+                         batch_index=entry["batchIndex"], device_id=device_id,
+                         phase_from=PHASE_SUCCESS, phase_to=PHASE_ROLLING_BACK)
 
 
-def trigger_failure_stop(state, rollout):
+def trigger_failure_stop(state, rollout, at_instant):
     """失败率超阈值：FAILED_STOPPED、冻结后续批次、向已成功设备下发回滚任务。
 
     立即置为 failed_stopped；若存在回滚任务，由各设备 rollback-report 收束为
     rolled_back/rollback_failed；若没有需要回滚的设备，保持 failed_stopped 直到
     下一次 batch check（显式收批入口）收束为 rolled_back，保证停止状态外部可见。
     """
-    freeze_and_dispatch_rollbacks(rollout, "batch_failure_threshold")
+    append_event(rollout, EVENT_STOPPED, at_instant,
+                 phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_FAILED_STOPPED,
+                 reason=STOP_REASON_FAILURE_THRESHOLD)
+    freeze_and_dispatch_rollbacks(rollout, "batch_failure_threshold", at_instant)
 
 
 def cmd_batch_abort(state, args):
@@ -576,20 +657,24 @@ def cmd_batch_abort(state, args):
         raise cli.InvalidState(
             "batch %s cannot be aborted (status: %s)" % (batch_id, rollout["status"])
         )
-    freeze_and_dispatch_rollbacks(rollout, "manual_abort")
+    append_event(rollout, EVENT_ABORTED, at_instant,
+                 phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_FAILED_STOPPED,
+                 reason=reason)
+    freeze_and_dispatch_rollbacks(rollout, "manual_abort", at_instant)
     rollout["abortReason"] = reason
     rollout["abortedAt"] = cli.format_instant(at_instant)
     # 尚有回滚任务时先保持 failed_stopped，由 rollback-report 收束；无任务时直接
     # 收束为 rolled_back（abort 响应本身已保证停止状态外部可见）。
-    finalize_rollback_if_done(rollout, converge_empty=True)
+    finalize_rollback_if_done(rollout, converge_empty=True, at_instant=at_instant)
     return batch_view(state, rollout, at_instant=at_instant)
 
 
-def finalize_rollback_if_done(rollout, converge_empty=False):
+def finalize_rollback_if_done(rollout, converge_empty=False, at_instant=None):
     """回滚任务全部收束后决定最终状态。
 
     converge_empty 为 True（显式收批入口）时，没有任何回滚任务也收束为
     rolled_back；否则空集合保留 failed_stopped，保证停止状态外部可见。
+    收束为终态（rolled_back/rollback_failed）时追加 finished 审计事件。
     """
     if rollout["status"] != STATUS_FAILED_STOPPED:
         return
@@ -597,6 +682,8 @@ def finalize_rollback_if_done(rollout, converge_empty=False):
     if not records:
         if converge_empty:
             rollout["status"] = STATUS_ROLLED_BACK
+            append_event(rollout, EVENT_FINISHED, at_instant,
+                         phase_from=STATUS_FAILED_STOPPED, phase_to=STATUS_ROLLED_BACK)
         return
     if any(r["state"] == "pending" for r in records):
         return
@@ -605,6 +692,8 @@ def finalize_rollback_if_done(rollout, converge_empty=False):
         if any(r["state"] == "failure" for r in records)
         else STATUS_ROLLED_BACK
     )
+    append_event(rollout, EVENT_FINISHED, at_instant,
+                 phase_from=STATUS_FAILED_STOPPED, phase_to=rollout["status"])
 
 
 # ---------------------------------------------------------------------------
@@ -651,8 +740,11 @@ def cmd_batch_rollback_report(state, args):
     entry["phase"] = (
         PHASE_ROLLBACK_SUCCEEDED if result == "success" else PHASE_ROLLBACK_FAILED
     )
+    append_event(rollout, EVENT_ROLLBACK_REPORTED, at_instant,
+                 batch_index=entry["batchIndex"], device_id=device_id, result=result,
+                 phase_from=PHASE_ROLLING_BACK, phase_to=entry["phase"])
 
-    finalize_rollback_if_done(rollout)
+    finalize_rollback_if_done(rollout, at_instant=at_instant)
 
     view = batch_view(state, rollout, at_instant=at_instant)
     view["report"] = {"deviceId": device_id, "result": result,
@@ -792,6 +884,85 @@ def cmd_batch_status(state, args):
 
 
 # ---------------------------------------------------------------------------
+# 审计时间线只读查询
+# ---------------------------------------------------------------------------
+
+def require_after_sequence(value):
+    """--after-sequence：缺省 0；非负整数，否则 InvalidArgument。"""
+    if value is None:
+        return 0
+    try:
+        sequence = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise cli.InvalidArgument(
+            "after-sequence must be a non-negative integer: %r" % (value,)
+        )
+    if sequence < 0:
+        raise cli.InvalidArgument(
+            "after-sequence must be a non-negative integer: %r" % (value,)
+        )
+    return sequence
+
+
+def require_timeline_limit(value):
+    """--limit：缺省 200；1 到 1000 的整数，否则 InvalidArgument。"""
+    if value is None:
+        return TIMELINE_DEFAULT_LIMIT
+    try:
+        limit = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise cli.InvalidArgument(
+            "limit must be an integer between 1 and %d: %r" % (TIMELINE_MAX_LIMIT, value)
+        )
+    if limit < 1 or limit > TIMELINE_MAX_LIMIT:
+        raise cli.InvalidArgument(
+            "limit must be an integer between 1 and %d: %r" % (TIMELINE_MAX_LIMIT, value)
+        )
+    return limit
+
+
+def timeline_event_view(event):
+    """按固定字段顺序输出一条事件；旧事件缺字段时补 None。"""
+    return {
+        "sequence": event.get("sequence"),
+        "type": event.get("type"),
+        "occurredAt": event.get("occurredAt"),
+        "batchIndex": event.get("batchIndex"),
+        "deviceId": event.get("deviceId"),
+        "result": event.get("result"),
+        "phaseFrom": event.get("phaseFrom"),
+        "phaseTo": event.get("phaseTo"),
+        "reason": event.get("reason"),
+    }
+
+
+def cmd_batch_timeline(state, args):
+    """只读时间线：批次不存在 DeviceNotFound；参数非法 InvalidArgument；不落盘。"""
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    rollout = get_rollout(state, batch_id)
+    after_sequence = require_after_sequence(args.after_sequence)
+    limit = require_timeline_limit(args.limit)
+    events = rollout.get("events")
+    if not isinstance(events, list):
+        # 旧状态不补历史：无事件、nextSequence=1。
+        events = []
+    selected = sorted(
+        (event for event in events
+         if isinstance(event, dict) and isinstance(event.get("sequence"), int)
+         and event["sequence"] > after_sequence),
+        key=lambda event: event["sequence"],
+    )
+    sequences = [event.get("sequence") for event in events
+                 if isinstance(event, dict) and isinstance(event.get("sequence"), int)]
+    next_sequence = max(sequences) + 1 if sequences else 1
+    return {
+        "batchId": rollout["batchId"],
+        "nextSequence": next_sequence,
+        "events": [timeline_event_view(event) for event in selected[:limit]],
+    }
+
+
+# ---------------------------------------------------------------------------
 # 与公开心跳入口（device heartbeat）的桥接
 # ---------------------------------------------------------------------------
 
@@ -904,3 +1075,12 @@ def register_parsers(subparsers, add_state_option):
                               help="观察时刻（ISO 8601），缺省取当前 UTC；用于区分升级中/等待心跳")
     batch_status.set_defaults(handler=cmd_batch_status, mutating=False)
     add_state_option(batch_status)
+
+    batch_timeline = batch_sub.add_parser("timeline", help="查询批次审计时间线（只读）")
+    batch_timeline.add_argument("--batch-id", required=True)
+    batch_timeline.add_argument("--after-sequence", default=None,
+                                help="只返回 sequence 严格大于该值的事件，非负整数（默认 0）")
+    batch_timeline.add_argument("--limit", default=None,
+                                help="返回最早的事件条数，1 到 1000 的整数（默认 200）")
+    batch_timeline.set_defaults(handler=cmd_batch_timeline, mutating=False)
+    add_state_option(batch_timeline)
