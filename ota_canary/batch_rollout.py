@@ -10,6 +10,9 @@
   仅当前版本等于 stableVersion 且未被其他 in_progress/failed_stopped 发布占用的设备
   合格，任一不合格即拒绝启动，全部合格时仅第一批置为 pending_upgrade；
 - 批次逐批放量，设备通过公开入口回传心跳、当前固件版本与升级终态；
+- stabilization-seconds > 0 时本批集齐终态且失败率未超阈值后进入稳定观察期：
+  保持 in_progress 并产生 stabilizationDeadline（本批有效心跳最大值加观察秒数，
+  无有效心跳时锚点为本批开始时刻），仅 batch check --at 严格晚于截止时刻才推进；
 - 本批失败率严格大于阈值时自动 FAILED_STOPPED、冻结后续批次，并向已成功升级的
   设备下发回滚到稳定版本的任务，逐台记录 PENDING/成功/失败，最终 ROLLED_BACK
   或 ROLLBACK_FAILED；
@@ -215,6 +218,23 @@ def require_policy_timeout(value):
     return seconds
 
 
+def require_policy_stabilization(value):
+    """稳定观察期秒数：大于等于 0 的整数，缺省 0；非整数或负数 InvalidBatchPolicy。"""
+    if value is None:
+        return 0
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise InvalidBatchPolicy(
+            "stabilization-seconds must be a non-negative integer: %r" % (value,)
+        )
+    if seconds < 0:
+        raise InvalidBatchPolicy(
+            "stabilization-seconds must be greater than or equal to 0: %r" % (value,)
+        )
+    return seconds
+
+
 def require_batch_device_ids(values):
     """目标设备集合：未提供/空列表 -> EmptyDeviceSet；空值/重复 -> InvalidArgument。"""
     if not values:
@@ -278,10 +298,11 @@ def cmd_batch_create(state, args):
     # 3) 设备集合非空
     device_ids = require_batch_device_ids(getattr(args, "target_device_id", None))
 
-    # 4) 每批数量为正整数、失败率阈值严格 (0,1)、心跳超时大于 0
+    # 4) 每批数量为正整数、失败率阈值严格 (0,1)、心跳超时大于 0、观察期为非负整数
     batch_size = require_policy_batch_size(args.batch_size)
     _, threshold = require_failure_threshold(args.failure_threshold)
     heartbeat_timeout = require_policy_timeout(args.heartbeat_timeout_seconds)
+    stabilization_seconds = require_policy_stabilization(args.stabilization_seconds)
 
     # 其余沿用既有入口约定：设备必须存在
     for device_id in device_ids:
@@ -294,6 +315,8 @@ def cmd_batch_create(state, args):
         "batchSize": batch_size,
         "failureThreshold": str(threshold),
         "heartbeatTimeoutSeconds": heartbeat_timeout,
+        "stabilizationSeconds": stabilization_seconds,
+        "stabilizationDeadline": None,
         "targetDeviceIds": device_ids,
         "status": STATUS_PENDING,
         "frozen": False,
@@ -581,13 +604,22 @@ def cmd_batch_check(state, args):
             expired.append(device_id)
     expired.sort()
     finalize_batch_if_ready(state, rollout, at_instant)
+    # 观察期仅由显式收批入口跨越：at 严格晚于 stabilizationDeadline 才推进，
+    # 等于或更早保持不变；deadline 过后未 check 不自动推进。
+    advance_stabilized_batch_if_due(rollout, at_instant)
     view = batch_view(state, rollout, at_instant=at_instant)
     view["expiredDevices"] = expired
     return view
 
 
 def finalize_batch_if_ready(state, rollout, at_instant):
-    """本批全部取得终态后：判失败率 -> 自动停止回滚 / 推进下一批 / 完成。"""
+    """本批全部取得终态后：判失败率 -> 自动停止回滚 / 进入观察 / 立即推进。
+
+    report 路径在本批集齐终态时调用本函数：观察期大于 0 时只产生
+    stabilizationDeadline 并保持 in_progress、不开下一批，不自动推进
+    （deadline 过后未经 batch check 不推进）；是否越过截止时刻由 check 路径
+    另行调用 advance_stabilized_batch_if_due 判定。
+    """
     current = rollout["currentBatch"]
     group = rollout["batches"][current]
     entries = rollout["devices"]
@@ -599,6 +631,53 @@ def finalize_batch_if_ready(state, rollout, at_instant):
     if rate > threshold:
         trigger_failure_stop(state, rollout, at_instant)
         return
+    if rollout.get("stabilizationSeconds", 0) > 0:
+        # 失败率未超阈值：进入稳定观察期，截止时刻只计算一次（终态与有效心跳此后冻结）。
+        if rollout.get("stabilizationDeadline") is None:
+            rollout["stabilizationDeadline"] = compute_stabilization_deadline(rollout)
+        return
+    advance_or_finish_batch(rollout, at_instant)
+
+
+def compute_stabilization_deadline(rollout):
+    """观察期截止时刻：本批有效心跳最大值 + stabilization-seconds。
+
+    本批无任何有效心跳时锚点取 currentBatchStartedAt；输出统一为 UTC Z。
+    """
+    current = rollout["currentBatch"]
+    heartbeats = []
+    for device_id in rollout["batches"][current]:
+        heartbeat_text = rollout["devices"][device_id].get("lastHeartbeatAt")
+        if heartbeat_text:
+            heartbeats.append(cli.parse_time(heartbeat_text))
+    if heartbeats:
+        base = max(heartbeats)
+    else:
+        base = cli.parse_time(rollout["currentBatchStartedAt"])
+    return cli.format_instant(
+        base + timedelta(seconds=rollout["stabilizationSeconds"])
+    )
+
+
+def advance_stabilized_batch_if_due(rollout, at_instant):
+    """check 路径专用：观察期内 at 严格晚于截止时刻才推进下一批或 completed。
+
+    重复 check 不会重复推进：推进后 currentBatch 已切换或状态已为 completed，
+    stabilizationDeadline 同时清空。
+    """
+    deadline_text = rollout.get("stabilizationDeadline")
+    if deadline_text is None or rollout["status"] != STATUS_IN_PROGRESS:
+        return
+    if at_instant <= cli.parse_time(deadline_text):
+        return
+    rollout["stabilizationDeadline"] = None
+    advance_or_finish_batch(rollout, at_instant)
+
+
+def advance_or_finish_batch(rollout, at_instant):
+    """推进下一批（batch_opened 已在 start 记录，此处记 batch_advanced）或完成。"""
+    current = rollout["currentBatch"]
+    rollout["stabilizationDeadline"] = None
     if current + 1 == len(rollout["batches"]):
         rollout["status"] = STATUS_COMPLETED
         rollout["frozen"] = False
@@ -620,6 +699,8 @@ def freeze_and_dispatch_rollbacks(rollout, stop_reason, at_instant):
     rollout["frozen"] = True
     rollout["stopReason"] = stop_reason
     rollout["currentBatchStartedAt"] = None
+    # 冻结即退出观察期：清空观察截止时刻（自动阈值停止与人工 abort 共用本路径）。
+    rollout["stabilizationDeadline"] = None
     ordered = sorted(rollout["devices"].items(),
                      key=lambda kv: (kv[1]["batchIndex"], kv[0]))
     for device_id, entry in ordered:
@@ -840,6 +921,9 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
         "batchSize": rollout["batchSize"],
         "failureThreshold": float(Decimal(rollout["failureThreshold"])),
         "heartbeatTimeoutSeconds": rollout["heartbeatTimeoutSeconds"],
+        # 旧状态缺少观察期字段时分别显示 0 与 null，status 只读不补写历史。
+        "stabilizationSeconds": rollout.get("stabilizationSeconds", 0),
+        "stabilizationDeadline": rollout.get("stabilizationDeadline"),
         "targetDeviceIds": list(rollout["targetDeviceIds"]),
         "status": rollout["status"],
         "frozen": rollout["frozen"],
@@ -1015,6 +1099,9 @@ def register_parsers(subparsers, add_state_option):
                               help="可继续推进的失败率阈值，严格大于 0 且小于 1 的小数（如 0.5）")
     batch_create.add_argument("--heartbeat-timeout-seconds", required=True,
                               help="心跳超时时长（秒），大于 0 的整数")
+    batch_create.add_argument("--stabilization-seconds", default=None,
+                              help="当前批终态集齐后的稳定观察秒数，大于等于 0 的整数，缺省 0；"
+                                   "与 release create 的同名参数互不影响")
     batch_create.add_argument("--target-device-id", action="append",
                               default=argparse.SUPPRESS,
                               help="目标设备，可重复；集合必须非空")

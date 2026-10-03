@@ -18,6 +18,7 @@ python -m ota_canary firmware list
 python -m ota_canary batch create \
     --batch-id B1 --target-version 2.0.0 --stable-version 1.0.0 \
     --batch-size 2 --failure-threshold 0.5 --heartbeat-timeout-seconds 900 \
+    --stabilization-seconds 300 \
     --target-device-id d1 --target-device-id d2 --target-device-id d3
 
 # 开始放量：仅把第一批设备置为 pending_upgrade
@@ -59,9 +60,32 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
    （固件存在指已 `firmware register`，或已有设备当前运行该版本）
 3. 设备集合为空（未提供 `--target-device-id`）→ `EmptyDeviceSet`
 4. 每批数量不是正整数、失败率阈值不满足严格 `0 < x < 1`、
-   心跳超时不大于 0 → `InvalidBatchPolicy`
+   心跳超时不大于 0、`stabilization-seconds` 非整数或为负数
+   → `InvalidBatchPolicy`
 5. 版本号格式非法、设备 ID 空/重复、设备未登记等参数问题沿用既有 `InvalidArgument`
    与 `DeviceNotFound`。
+
+`batch create --stabilization-seconds` 为可选参数，取大于等于 0 的整数，缺省 `0`，
+与 `release create` 的同名参数互不影响；为 `0` 时保持既有推进时机（集齐终态即推进）。
+
+## 稳定观察期（stabilization-seconds > 0）
+
+- 当前批设备全部取得终态后，先判失败率：失败率**严格大于** `failure-threshold`
+  时立即 `failed_stopped`、冻结并下发回滚，与观察期配置无关；失败率未超阈值时
+  **不**立即推进下一批：批次保持 `in_progress`、`currentBatch` 不变，
+  并产生 `stabilizationDeadline`。
+- `stabilizationDeadline` 取**本批有效心跳的最大时刻**加 `stabilization-seconds`；
+  本批无任何有效心跳（含全部因超时收束的情形）时锚点取 `currentBatchStartedAt`；
+  结果统一输出为 ISO 8601 UTC `Z` 时间。截止时刻在进入观察期时计算一次，之后不变。
+- `batch check --at` 的顺序固定为：先补齐超过心跳超时仍无终态的设备
+  `failure(reason=timeout)`，再判本批失败率——超阈值立即停止回滚；
+  `stabilization-seconds` 为 `0` 时立即推进；大于 `0` 时仅当 `at`
+  **严格晚于** `stabilizationDeadline` 才推进下一批，末批则 `completed`；
+  `at` 等于或早于截止时刻时批次保持不变（既不推进也不重复记录）。
+- 截止时刻过后但未执行 `batch check` 时**不**自动推进；一次 `check` 同时补齐
+  超时结果并越过截止时刻即直接推进；越过截止时刻后重复 `check` 不重复推进。
+- 推进时清空 `stabilizationDeadline`；阈值停止与 `batch abort` 在冻结时同样清空。
+  观察期内设备仍属于本批，后续批次设备依旧被冻结，`report` 的幂等与冲突规则不变。
 
 ## 启动前资格预检（batch plan，只读）
 
@@ -96,9 +120,12 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   批次立即 `failed_stopped`，`frozen=true`，不再下发后续批次；向本批及此前批次
   **已升级成功**的设备下发回滚到稳定版本的任务（`rolling_back` / 回滚记录 `pending`）。
 - 所有回滚任务回报完毕：任一失败 → `rollback_failed`，全部成功 → `rolled_back`；
-  没有需要回滚的设备时直接 `rolled_back`。未超阈值则推进下一批，全部完成 → `completed`。
-- `batch abort` 是人工止损入口，仅接受 `in_progress` 批次：立即冻结后续批次、拒绝
-  新的升级报告，`stopReason` 固定为 `manual_abort`，并向**已成功**设备下发回滚到
+  没有需要回滚的设备时直接 `rolled_back`。未超阈值时：观察期为 0 立即推进下一批，
+  全部完成 → `completed`；观察期大于 0 时先进入稳定观察期（见下节），
+  由 `batch check --at` 严格晚于截止时刻后推进或完成。
+- `batch abort` 是人工止损入口，仅接受 `in_progress` 批次（含稳定观察期内）：立即冻结
+  后续批次、拒绝新的升级报告，**成功时清空 `stabilizationDeadline`**，
+  `stopReason` 固定为 `manual_abort`，并向**已成功**设备下发回滚到
   `stableVersion` 的任务（失败、超时、排队和未取得终态设备不生成任务）。尚有回滚
   任务时先保持 `failed_stopped`；全部成功或无任务时最终 `rolled_back`，任一失败则
   `rollback_failed`，收束规则与自动停止完全一致。批次不存在返回 `DeviceNotFound`；
@@ -123,7 +150,10 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 `batch status` 顶层还返回：`completedCount`、`failedCount`、`reportedCount`、
 `currentBatchReportedCount`、`failureRate`（当前推进批次已取得终态设备中的失败占比，
-无终态时为 `null`）、`currentBatch`、`frozen`（后续批次是否已冻结）、`phaseCounts`、
+无终态时为 `null`）、`currentBatch`、`frozen`（后续批次是否已冻结）、
+`stabilizationSeconds`（策略值，旧状态显示 `0`）、`stabilizationDeadline`
+（仅稳定观察期截止时刻非空；观察期外与旧状态均为 `null`，只读查询不补写）、
+`phaseCounts`、
 回滚计数（`rollbackTotal/Pending/Succeeded/Failed`）与逐设备 `devices[]`。
 `status` 只读，不补写超时结果；超过心跳超时但尚未 `check` 的设备显示
 `waiting_heartbeat`。
@@ -149,6 +179,9 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   `timeout_recorded`、`batch_advanced`、`stopped`、`rollback_started`、
   `rollback_reported`、`aborted`、`finished`。
 - `occurredAt` 取显式 `--at`、调用时刻或心跳时刻，统一为 ISO 8601 UTC `Z` 后缀。
+- `batch check` 越过观察期截止时刻推进下一批时追加 `batch_advanced`，末批完成时
+  追加 `finished`，`occurredAt` 取该次 `--at`；观察期内未越过截止时刻、且未补出
+  超时结果的 `check` 不产生任何事件。
 - 自动停止事件 `stopped` 的 `reason=failure_threshold`；人工中止事件 `aborted`
   的 `reason` 为去除首尾空白后的 `--reason`。
 
