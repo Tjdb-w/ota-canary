@@ -10,6 +10,10 @@
   仅当前版本等于 stableVersion 且未被其他 in_progress/paused/failed_stopped
   发布占用的设备
   合格，任一不合格即拒绝启动，全部合格时仅第一批置为 pending_upgrade；
+- ``batch create --canary-device-id``（可重复）指定金丝雀设备：须非空、不重复、
+  属于同一命令的 target-device-id 且数量不超过 batch-size；金丝雀按 device-id
+  升序进入第一批，非金丝雀按同序补足，其余目标按同序组成后续批次；未指定时
+  canaryDeviceIds 为 []，仍按 device-id 升序切批；
 - 批次逐批放量，设备通过公开入口回传心跳、当前固件版本与升级终态；
 - stabilization-seconds > 0 时本批集齐终态且失败率未超阈值后进入稳定观察期：
   保持 in_progress 并产生 stabilizationDeadline（本批有效心跳最大值加观察秒数，
@@ -297,6 +301,38 @@ def require_batch_device_ids(values):
     return sorted(ids)
 
 
+def require_canary_device_ids(values, target_ids, batch_size):
+    """金丝雀设备集合：未提供 -> []；空值/重复/非目标设备 -> InvalidArgument；
+    数量超过 batch-size -> InvalidBatchPolicy。按 device-id 升序返回。
+
+    金丝雀必须属于同一命令的 target-device-id 集合；登记存在性由目标设备的
+    统一存在性校验覆盖（金丝雀是目标的子集）。
+    """
+    if not values:
+        return []
+    seen = set()
+    ids = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise cli.InvalidArgument("canary-device-id must be a non-empty string: %r" % (value,))
+        device_id = value.strip()
+        if device_id in seen:
+            raise cli.InvalidArgument("duplicate canary-device-id: %s" % device_id)
+        seen.add(device_id)
+        ids.append(device_id)
+    target_set = set(target_ids)
+    for device_id in ids:
+        if device_id not in target_set:
+            raise cli.InvalidArgument(
+                "canary-device-id must be one of the target-device-id values: %s" % device_id
+            )
+    if len(ids) > batch_size:
+        raise InvalidBatchPolicy(
+            "canary device count %d exceeds batch-size %d" % (len(ids), batch_size)
+        )
+    return sorted(ids)
+
+
 def require_retry_device_ids(values):
     """重试设备集合：至少一个；空值/重复 -> InvalidArgument；按 device-id 升序返回。"""
     if not values:
@@ -368,7 +404,13 @@ def cmd_batch_create(state, args):
     stabilization_seconds = require_policy_stabilization(args.stabilization_seconds)
     rollback_timeout = require_rollback_timeout(getattr(args, "rollback_timeout_seconds", None))
 
-    # 其余沿用既有入口约定：设备必须存在
+    # 5) 金丝雀设备：非空不重复、属于目标集合、数量不超过 batch-size；
+    #    任一不满足即失败，不创建批次或改状态
+    canary_ids = require_canary_device_ids(
+        getattr(args, "canary_device_id", None), device_ids, batch_size
+    )
+
+    # 其余沿用既有入口约定：设备必须存在（金丝雀是目标子集，一并覆盖）
     for device_id in device_ids:
         cli.get_device(state, device_id)
 
@@ -384,6 +426,7 @@ def cmd_batch_create(state, args):
         "rollbackTimeoutSeconds": rollback_timeout,
         "rollbackDeadline": None,
         "targetDeviceIds": device_ids,
+        "canaryDeviceIds": canary_ids,
         "status": STATUS_PENDING,
         "frozen": False,
         "stopReason": None,
@@ -431,7 +474,10 @@ def evaluate_eligibility(state, rollout):
     - target_ids 为创建时去重集合，按 device-id 升序；
     - 当前版本等于 stableVersion 且未被其他 in_progress/failed_stopped 发布占用者合格；
     - 版本不符与占用兼一时 VERSION_MISMATCH 优先；
-    - batches 只含合格设备并按 batchSize 切分，无合格设备时为 []。
+    - batches 只含合格设备并按 batchSize 切分，无合格设备时为 []；
+    - 金丝雀（创建时登记的 canaryDeviceIds）按 device-id 升序进入第一批，
+      再用非金丝雀按同序补足，其余合格设备按同序组成后续批次；
+      未指定金丝雀（含旧状态缺字段）时保持纯 device-id 升序切批。
     """
     target_ids = sorted(rollout["targetDeviceIds"])
     # 显式目标先确认仍然存在（DeviceNotFound），再判版本与占用资格。
@@ -451,7 +497,12 @@ def evaluate_eligibility(state, rollout):
         else:
             eligible_ids.append(device_id)
     size = rollout["batchSize"]
-    batches = [eligible_ids[i:i + size] for i in range(0, len(eligible_ids), size)]
+    # 金丝雀优先：eligible_ids 已按 device-id 升序，金丝雀子集与非金丝雀子集各自
+    # 保持升序；拼接后按 batchSize 切分即“金丝雀进第一批、非金丝雀补足”。
+    canary = set(rollout.get("canaryDeviceIds") or [])
+    ordered = ([d for d in eligible_ids if d in canary]
+               + [d for d in eligible_ids if d not in canary])
+    batches = [ordered[i:i + size] for i in range(0, len(ordered), size)]
     return target_ids, eligible_ids, ineligible, batches
 
 
@@ -482,6 +533,7 @@ def cmd_batch_plan(state, args):
         "stableVersion": rollout["stableVersion"],
         "batchSize": rollout["batchSize"],
         "targetDeviceIds": target_ids,
+        "canaryDeviceIds": list(rollout.get("canaryDeviceIds") or []),
         "eligibleDeviceIds": eligible_ids,
         "ineligibleDevices": ineligible,
         "candidateCount": len(eligible_ids),
@@ -1219,6 +1271,9 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
     rollback_total = rollback_pending = rollback_succeeded = rollback_failed = 0
     rollback_timed_out = 0
     current_index = rollout["currentBatch"]
+    # 金丝雀身份只读展示：旧状态缺 canaryDeviceIds 时按 [] 显示，不补写历史。
+    canary_ids = list(rollout.get("canaryDeviceIds") or [])
+    canary_set = set(canary_ids)
 
     ordered = sorted(entries.items(), key=lambda kv: (kv[1]["batchIndex"], kv[0]))
     for device_id, entry in ordered:
@@ -1257,6 +1312,8 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
             "deviceId": device_id,
             "batchIndex": entry["batchIndex"],
             "phase": phase,
+            # 仅标记金丝雀身份，不改变 phase/terminal/rollback 等既有语义。
+            "canary": device_id in canary_set,
             "version": device.get("version"),
             "heartbeatAt": device.get("heartbeatAt"),
             "lastHeartbeatAt": entry.get("lastHeartbeatAt"),
@@ -1291,6 +1348,7 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
         ),
         "rollbackDeadline": rollout.get("rollbackDeadline"),
         "targetDeviceIds": list(rollout["targetDeviceIds"]),
+        "canaryDeviceIds": canary_ids,
         "status": rollout["status"],
         "frozen": rollout["frozen"],
         # 旧状态缺少暂停字段时按从未暂停读取：false / null / null。
@@ -1486,6 +1544,10 @@ def register_parsers(subparsers, add_state_option):
     batch_create.add_argument("--target-device-id", action="append",
                               default=argparse.SUPPRESS,
                               help="目标设备，可重复；集合必须非空")
+    batch_create.add_argument("--canary-device-id", action="append",
+                              default=argparse.SUPPRESS,
+                              help="金丝雀设备，可重复；须属于 target-device-id 集合、"
+                                   "不重复且数量不超过 batch-size，按 device-id 升序进入第一批")
     batch_create.set_defaults(handler=cmd_batch_create, mutating=True)
     add_state_option(batch_create)
 

@@ -71,16 +71,32 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 3. 设备集合为空（未提供 `--target-device-id`）→ `EmptyDeviceSet`
 4. 每批数量不是正整数、失败率阈值不满足严格 `0 < x < 1`、
    心跳超时不大于 0、`stabilization-seconds` 非整数或为负数、
-   `rollback-timeout-seconds` 非整数或小于 1
+   `rollback-timeout-seconds` 非整数或小于 1、金丝雀数量超过 `batch-size`
    → `InvalidBatchPolicy`
-5. 版本号格式非法、设备 ID 空/重复、设备未登记等参数问题沿用既有 `InvalidArgument`
-   与 `DeviceNotFound`。
+5. 版本号格式非法、设备 ID 空/重复、金丝雀为空/重复/不属于目标集合、
+   设备未登记等参数问题沿用既有 `InvalidArgument` 与 `DeviceNotFound`。
 
 `batch create --stabilization-seconds` 为可选参数，取大于等于 0 的整数，缺省 `0`，
 与 `release create` 的同名参数互不影响；为 `0` 时保持既有推进时机（集齐终态即推进）。
 
 `batch create --rollback-timeout-seconds` 为可选参数，取大于等于 1 的整数，缺省
 `900`；非法值返回 `InvalidBatchPolicy` 且不写状态。该策略用于回滚收束时限（见下节）。
+
+## 金丝雀设备优先放量（--canary-device-id）
+
+- `batch create` 增加可重复的 `--canary-device-id`：把关键设备确定为首批放量对象。
+  值须非空且不重复，并属于同一命令的 `--target-device-id` 集合，数量不得超过
+  `batch-size`。空值、重复或非目标设备返回 `InvalidArgument`，数量超限返回
+  `InvalidBatchPolicy`，未登记设备返回 `DeviceNotFound`；这些失败均不创建批次、
+  不改变任何状态。
+- 未提供时 `canaryDeviceIds` 为 `[]`，仍按 device-id 升序切批（既有行为不变）。
+- 指定后：金丝雀按 device-id 升序进入第一批，再用非金丝雀按同序补足第一批，
+  其余目标按同序组成后续批次。`batch plan` 与 `batch start` 使用完全相同的
+  资格、分组与排序口径。
+- `batch create`、`batch plan`、`batch start` 成功视图返回 `canaryDeviceIds`；
+  `batch status` 顶层增加 `canaryDeviceIds`，`devices` 每项增加 `canary`
+  （仅标记金丝雀身份，不改变 phase、terminal、rollback、failureRate、占用与
+  错误语义）。旧状态缺少该字段时显示 `[]` 与 `false`，只读不补写。
 
 ## 回滚收束时限（rollback-timeout-seconds）
 
@@ -153,8 +169,9 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 - 对 `pending` 发布执行 `batch plan --batch-id B1 [--at 时间]` 做只读预检，
   输出 `batchId`、`targetVersion`、`stableVersion`、`batchSize`、`targetDeviceIds`、
-  `eligibleDeviceIds`、`ineligibleDevices`、`candidateCount`、`batches`。
-- `targetDeviceIds` 取创建时去重集合并按 device-id 升序。
+  `canaryDeviceIds`、`eligibleDeviceIds`、`ineligibleDevices`、`candidateCount`、`batches`。
+- `targetDeviceIds` 取创建时去重集合并按 device-id 升序；`canaryDeviceIds` 取创建时
+  登记的金丝雀集合（升序），旧状态缺字段时显示 `[]`。
 - 合格条件：设备当前版本等于 `stableVersion`，且未被**其他**处于
   `in_progress`、`paused` 或 `failed_stopped` 的发布占用；`completed`、
   `rolled_back`、`rollback_failed` 释放占用，`pending` 发布尚未建批也不占用。
@@ -162,6 +179,7 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   版本不符为 `VERSION_MISMATCH`，被占用为 `DEVICE_BUSY`；两者兼有时
   `VERSION_MISMATCH` 优先。
 - `batches` 只含合格设备并按 `batchSize` 切分；没有合格设备时为 `[]`。
+  指定金丝雀时合格的金丝雀按 device-id 升序进入第一批，非金丝雀按同序补足。
 - `plan` 只读、不创建批次或设备阶段、不改设备版本/心跳/占用，重复调用结果一致；
   `--at` 仅做时间合法性校验，不影响预检结论。
 - 错误：发布不存在返回 `DeviceNotFound`；发布非 `pending` 返回 `InvalidState`；
