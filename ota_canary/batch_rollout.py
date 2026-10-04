@@ -17,6 +17,12 @@
 - 本批失败率严格大于阈值时自动 FAILED_STOPPED、冻结后续批次，并向已成功升级的
   设备下发回滚到稳定版本的任务，逐台记录 PENDING/成功/失败，最终 ROLLED_BACK
   或 ROLLBACK_FAILED；
+- 回滚收束时限（rollback-timeout-seconds，缺省 900）：停止或 abort 派发回滚后
+  存在 pending 任务时，以停止时刻加策略秒数生成 rollbackDeadline（UTC Z），
+  无任务为 null；batch check 仅在 failed_stopped 且 at 严格晚于截止时刻时把
+  pending 任务补记为 failure(reason=timeout)、设备阶段置 rollback_failed，
+  version/heartbeatAt 不变；任务全部收束后按有无回滚失败落 rolled_back 或
+  rollback_failed，避免设备无终态时批次停在 failed_stopped。
 - 人工止损 ``batch abort`` 对 IN_PROGRESS 与 PAUSED 均可用：立即冻结后续批次、
   拒绝新的升级报告，并向已成功设备下发同样的回滚任务，收束口径与自动停止一致。
 - 临时暂停/恢复 ``batch pause``/``batch resume``：仅 in_progress 可暂停为 paused，
@@ -105,6 +111,7 @@ EVENT_BATCH_ADVANCED = "batch_advanced"
 EVENT_STOPPED = "stopped"
 EVENT_ROLLBACK_STARTED = "rollback_started"
 EVENT_ROLLBACK_REPORTED = "rollback_reported"
+EVENT_ROLLBACK_TIMED_OUT = "rollback_timed_out"
 EVENT_ABORTED = "aborted"
 EVENT_PAUSED = "paused"
 EVENT_RESUMED = "resumed"
@@ -116,6 +123,13 @@ STOP_REASON_FAILURE_THRESHOLD = "failure_threshold"
 # timeline 查询的默认与上限
 TIMELINE_DEFAULT_LIMIT = 200
 TIMELINE_MAX_LIMIT = 1000
+
+# 回滚收束时限缺省值（旧状态缺少策略字段时按此解释）
+DEFAULT_ROLLBACK_TIMEOUT_SECONDS = 900
+
+# 回滚记录/事件的 reason：成功为 None；正常失败回传为 reported；收束时限超时为 timeout
+ROLLBACK_REASON_REPORTED = "reported"
+ROLLBACK_REASON_TIMEOUT = "timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +257,23 @@ def require_policy_stabilization(value):
     return seconds
 
 
+def require_policy_rollback_timeout(value):
+    """回滚收束时限秒数：大于等于 1 的整数，缺省 900；非整数或小于 1 InvalidBatchPolicy。"""
+    if value is None:
+        return DEFAULT_ROLLBACK_TIMEOUT_SECONDS
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise InvalidBatchPolicy(
+            "rollback-timeout-seconds must be a positive integer: %r" % (value,)
+        )
+    if seconds < 1:
+        raise InvalidBatchPolicy(
+            "rollback-timeout-seconds must be greater than or equal to 1: %r" % (value,)
+        )
+    return seconds
+
+
 def require_batch_device_ids(values):
     """目标设备集合：未提供/空列表 -> EmptyDeviceSet；空值/重复 -> InvalidArgument。"""
     if not values:
@@ -311,6 +342,9 @@ def cmd_batch_create(state, args):
     _, threshold = require_failure_threshold(args.failure_threshold)
     heartbeat_timeout = require_policy_timeout(args.heartbeat_timeout_seconds)
     stabilization_seconds = require_policy_stabilization(args.stabilization_seconds)
+    rollback_timeout_seconds = require_policy_rollback_timeout(
+        getattr(args, "rollback_timeout_seconds", None)
+    )
 
     # 其余沿用既有入口约定：设备必须存在
     for device_id in device_ids:
@@ -325,6 +359,8 @@ def cmd_batch_create(state, args):
         "heartbeatTimeoutSeconds": heartbeat_timeout,
         "stabilizationSeconds": stabilization_seconds,
         "stabilizationDeadline": None,
+        "rollbackTimeoutSeconds": rollback_timeout_seconds,
+        "rollbackDeadline": None,
         "targetDeviceIds": device_ids,
         "status": STATUS_PENDING,
         "frozen": False,
@@ -623,11 +659,13 @@ def cmd_batch_check(state, args):
             % (batch_id, rollout["status"])
         )
     if rollout["status"] == STATUS_FAILED_STOPPED:
-        # 无回滚任务的停止态在显式收批入口再次到达时收束为 rolled_back；
-        # 仍有 pending 回滚任务时保持 failed_stopped，等待 rollback-report。
+        # 显式收批入口：先按回滚收束时限把逾期 pending 任务补为 failure(timeout)，
+        # 再收束终态（无回滚任务的停止态收束为 rolled_back）。
+        expired_rollback = expire_rollback_timeouts(rollout, at_instant)
         finalize_rollback_if_done(rollout, converge_empty=True, at_instant=at_instant)
         view = batch_view(state, rollout, at_instant=at_instant)
         view["expiredDevices"] = []
+        view["rollbackExpiredDeviceIds"] = expired_rollback
         return view
     if rollout["status"] != STATUS_IN_PROGRESS:
         raise cli.InvalidState(
@@ -668,6 +706,8 @@ def cmd_batch_check(state, args):
     advance_stabilized_batch_if_due(rollout, at_instant)
     view = batch_view(state, rollout, at_instant=at_instant)
     view["expiredDevices"] = expired
+    # 回滚收束时限仅在 failed_stopped 分支处理；进行中的 check 恒为空列表。
+    view["rollbackExpiredDeviceIds"] = []
     return view
 
 
@@ -790,6 +830,9 @@ def freeze_and_dispatch_rollbacks(rollout, stop_reason, at_instant):
 
     失败、超时、排队和未取得终态的设备不生成任务；设备阶段与终态报告保留现场。
     每台收到回滚任务的设备追加一条 rollback_started 事件。
+
+    有回滚任务时以停止时刻加策略 rollbackTimeoutSeconds 生成 rollbackDeadline
+    （ISO 8601 UTC Z）；无任务时置为 None。旧状态缺少策略字段按 900 解释。
     """
     rollout["status"] = STATUS_FAILED_STOPPED
     rollout["frozen"] = True
@@ -799,13 +842,29 @@ def freeze_and_dispatch_rollbacks(rollout, stop_reason, at_instant):
     rollout["stabilizationDeadline"] = None
     ordered = sorted(rollout["devices"].items(),
                      key=lambda kv: (kv[1]["batchIndex"], kv[0]))
+    pending_dispatched = 0
     for device_id, entry in ordered:
         if entry["phase"] == PHASE_SUCCESS:
             entry["phase"] = PHASE_ROLLING_BACK
-            entry["rollback"] = {"state": "pending", "heartbeatAt": None, "version": None}
+            entry["rollback"] = {
+                "state": "pending",
+                "reason": None,
+                "heartbeatAt": None,
+                "version": None,
+            }
+            pending_dispatched += 1
             append_event(rollout, EVENT_ROLLBACK_STARTED, at_instant,
                          batch_index=entry["batchIndex"], device_id=device_id,
                          phase_from=PHASE_SUCCESS, phase_to=PHASE_ROLLING_BACK)
+    if pending_dispatched:
+        timeout_seconds = rollout.get(
+            "rollbackTimeoutSeconds", DEFAULT_ROLLBACK_TIMEOUT_SECONDS
+        )
+        rollout["rollbackDeadline"] = cli.format_instant(
+            at_instant + timedelta(seconds=timeout_seconds)
+        )
+    else:
+        rollout["rollbackDeadline"] = None
 
 
 def trigger_failure_stop(state, rollout, at_instant):
@@ -902,6 +961,45 @@ def cmd_batch_abort(state, args):
     return batch_view(state, rollout, at_instant=at_instant)
 
 
+def expire_rollback_timeouts(rollout, at_instant):
+    """回滚收束时限到期后把仍 pending 的回滚任务补为 failure(reason=timeout)。
+
+    触发条件：failed_stopped、rollbackDeadline 非空且 at 严格晚于截止时刻
+    （at 等于截止时刻不算超时）。旧 failed_stopped 状态缺少 rollbackDeadline
+    时显示 null 且不猜超时：本函数直接返回空列表、不变更任何状态。
+
+    仅改回滚记录（state/result 口径为 failure、reason=timeout）与设备阶段
+    （rolling_back -> rollback_failed）：回滚记录与公开设备表的 version、
+    heartbeatAt 一律保持不变。每台超时设备追加一条 rollback_timed_out 事件，
+    按 device-id 升序处理。重复 check 或已无 pending 任务时不重复变更、不重复
+    追加事件。
+    """
+    if rollout.get("status") != STATUS_FAILED_STOPPED:
+        return []
+    deadline_text = rollout.get("rollbackDeadline")
+    if not deadline_text:
+        return []
+    if at_instant <= cli.parse_time(deadline_text):
+        return []
+    expired = []
+    for device_id in sorted(rollout["devices"]):
+        entry = rollout["devices"][device_id]
+        record = entry.get("rollback")
+        if not isinstance(record, dict) or record.get("state") != "pending":
+            continue
+        phase_before = entry["phase"]
+        record["state"] = "failure"
+        record["reason"] = ROLLBACK_REASON_TIMEOUT
+        entry["phase"] = PHASE_ROLLBACK_FAILED
+        expired.append(device_id)
+        append_event(rollout, EVENT_ROLLBACK_TIMED_OUT, at_instant,
+                     batch_index=entry["batchIndex"], device_id=device_id,
+                     result="failure", phase_from=phase_before,
+                     phase_to=PHASE_ROLLBACK_FAILED,
+                     reason=ROLLBACK_REASON_TIMEOUT)
+    return expired
+
+
 def finalize_rollback_if_done(rollout, converge_empty=False, at_instant=None):
     """回滚任务全部收束后决定最终状态。
 
@@ -948,7 +1046,10 @@ def cmd_batch_rollback_report(state, args):
         )
     record = entry["rollback"]
     if record["state"] != "pending":
-        # 幂等：同一回滚任务重复上报同一结果直接返回；冲突结果拒绝。
+        # 幂等：同一回滚任务重复上报同一结果直接返回、不计数、不改记录；
+        # 冲突结果拒绝。收束时限超时补记的 failure(reason=timeout) 同样遵循：
+        # 之后重复 failure 幂等（保留 timeout 现场），补报 success 返回
+        # InvalidArgument 且不改任何状态。首次终态优先，迟到结果不得翻案。
         if record["state"] != result:
             raise cli.InvalidArgument(
                 "device %s rollback already %s in batch %s; late result %s rejected"
@@ -960,6 +1061,8 @@ def cmd_batch_rollback_report(state, args):
         return view
 
     record["state"] = result
+    # 成功无 reason（null）；设备正常回报失败记 reported；timeout 仅由 check 补记。
+    record["reason"] = None if result == "success" else ROLLBACK_REASON_REPORTED
     record["heartbeatAt"] = heartbeat_text
     record["version"] = version
     device = state["devices"].get(device_id)
@@ -1031,6 +1134,7 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
     reported = failed = succeeded = 0
     batch_reported = batch_failed = 0
     rollback_total = rollback_pending = rollback_succeeded = rollback_failed = 0
+    rollback_timed_out = 0
     current_index = rollout["currentBatch"]
 
     ordered = sorted(entries.items(), key=lambda kv: (kv[1]["batchIndex"], kv[0]))
@@ -1057,6 +1161,8 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
                 rollback_succeeded += 1
             else:
                 rollback_failed += 1
+            if entry["rollback"].get("reason") == ROLLBACK_REASON_TIMEOUT:
+                rollback_timed_out += 1
         device = state["devices"].get(device_id, {})
         devices.append({
             "deviceId": device_id,
@@ -1079,6 +1185,12 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
         # 旧状态缺少观察期字段时分别显示 0 与 null，status 只读不补写历史。
         "stabilizationSeconds": rollout.get("stabilizationSeconds", 0),
         "stabilizationDeadline": rollout.get("stabilizationDeadline"),
+        # 旧状态缺少回滚收束时限策略时按缺省 900 解释；rollbackDeadline 缺字段
+        # 或无回滚任务时为 null，只读不补写、不猜超时。
+        "rollbackTimeoutSeconds": rollout.get(
+            "rollbackTimeoutSeconds", DEFAULT_ROLLBACK_TIMEOUT_SECONDS
+        ),
+        "rollbackDeadline": rollout.get("rollbackDeadline"),
         "targetDeviceIds": list(rollout["targetDeviceIds"]),
         "status": rollout["status"],
         "frozen": rollout["frozen"],
@@ -1103,6 +1215,7 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
         "rollbackPending": rollback_pending,
         "rollbackSucceeded": rollback_succeeded,
         "rollbackFailed": rollback_failed,
+        "rollbackTimedOutCount": rollback_timed_out,
         "devices": devices,
     }
     if reported_device is not None:
@@ -1263,6 +1376,9 @@ def register_parsers(subparsers, add_state_option):
     batch_create.add_argument("--stabilization-seconds", default=None,
                               help="当前批终态集齐后的稳定观察秒数，大于等于 0 的整数，缺省 0；"
                                    "与 release create 的同名参数互不影响")
+    batch_create.add_argument("--rollback-timeout-seconds", default=None,
+                              help="回滚收束时限秒数，大于等于 1 的整数，缺省 900；"
+                                   "停止派发回滚后，仍 pending 的任务超过此时限由 check 补记超时")
     batch_create.add_argument("--target-device-id", action="append",
                               default=argparse.SUPPRESS,
                               help="目标设备，可重复；集合必须非空")
