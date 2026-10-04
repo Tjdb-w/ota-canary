@@ -52,6 +52,11 @@ python -m ota_canary batch abort --batch-id B1 \
 python -m ota_canary batch rollback-report --batch-id B1 --device-id d1 \
     --result success --version 1.0.0 --heartbeat-at 2026-10-01T10:10:00Z
 
+# 批次 rollback_failed 后，对最新回滚为 failure/timeout 的设备再试一次回滚
+python -m ota_canary batch rollback-retry --batch-id B1 \
+    --device-id d1 --device-id d2 \
+    --reason 网络恢复后重试 --at 2026-10-01T11:00:00Z
+
 # 只读状态查询
 python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 ```
@@ -97,6 +102,33 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   仍可正常上报，仅 `check` 的 `at` 严格晚于它才判定超时。
 - 旧状态缺 `rollbackTimeoutSeconds` 按 `900` 解释；已有 `failed_stopped` 批次缺
   `rollbackDeadline` 时显示 `null`，不据此猜测超时。
+
+## 回滚重试（batch rollback-retry）
+
+- `batch rollback-retry --batch-id B1 --device-id d1 [--device-id d2 ...]
+  --reason 原因 --at <ISO 8601>` 供 `rollback_failed` 批次中最新回滚为
+  `failure`（设备回传）或 `timeout`（超时收束）且未成功的设备再试一次回滚；
+  既有命令的请求/响应不变。
+- 校验：`--device-id` 至少一个、不得重复，按 device-id 升序处理；设备须属于该
+  批次，且最新回滚记录为 `failure`（`reason=reported` 或 `timeout`）。
+  `--reason` 去除首尾空白后须为 1 到 200 个 Unicode 字符；`--at` 须为合法时间。
+  批次或设备不存在返回 `DeviceNotFound`；批次非 `rollback_failed` 返回
+  `InvalidState`；设备不属批次、无失败回滚、已成功、重复 id、reason 或 at 非法
+  返回 `InvalidArgument`。所有校验通过前不写任何状态：错误走 stderr JSON、
+  非零退出且不修改状态文件。
+- 成功后：每台设备阶段回到 `rolling_back`、回滚记录重置为 `pending`；批次回到
+  `failed_stopped` 且 `frozen=true`；设备版本与心跳不变；`rollbackDeadline` 重算为
+  `at + rollbackTimeoutSeconds`。每台设备以 `at` 追加一条
+  `type=rollback_retry_started`（`phaseFrom=rollback_failed`、
+  `phaseTo=rolling_back`、`reason` 为修剪后的 `--reason`）的时间线事件。
+- `batch status` 新增 `retryDeviceIds`、`retryStartedAt`（最近一次重试的设备
+  集合与时刻，缺省 `[]`、`null`）与 `rollbackAttempts`（全部被取代的失败尝试，
+  依序保留 `state`、`result`、`reason`、`heartbeatAt`、`version`，只增不覆盖，
+  缺省 `[]`）；`rollbackTimedOutCount` 累计各次尝试与当前记录中的 timeout。
+- 重试后的结果仍走 `batch rollback-report`：既有幂等、冲突、首次终态、`check`
+  与心跳规则不变；再次超时由 `batch check` 记 `failure(reason=timeout)` 并追加
+  `rollback_timed_out` 事件。当前回滚记录全部 `success` 时批次收束为
+  `rolled_back`，否则为 `rollback_failed` 并可再次 `rollback-retry`。
 
 ## 稳定观察期（stabilization-seconds > 0）
 
@@ -221,7 +253,10 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 `rollbackTimeoutSeconds`（回滚收束时限策略值，旧状态按 `900` 显示）、
 `rollbackDeadline`（停止或中止派发回滚且仍有 pending 任务时，为停止时刻加
 `rollback-timeout-seconds` 的 UTC `Z` 时刻；无回滚任务、未停止及缺该字段的旧状态
-均为 `null`，不据此猜测超时）、`rollbackTimedOutCount`（因超时收束的回滚任务数）、
+均为 `null`，不据此猜测超时）、`rollbackTimedOutCount`（因超时收束的回滚任务数，含重试归档尝试中的 timeout）、
+`retryDeviceIds`/`retryStartedAt`（最近一次回滚重试的设备集合与时刻，缺省
+`[]`/`null`）、`rollbackAttempts`（被重试取代的失败回滚尝试，依序保留
+`state`/`result`/`reason`/`heartbeatAt`/`version`，只增不覆盖，缺省 `[]`）、
 `phaseCounts`、
 回滚计数（`rollbackTotal/Pending/Succeeded/Failed`）与逐设备 `devices[]`。
 每条回滚记录含 `state`（`pending`/`success`/`failure`）、`heartbeatAt`、`version`
@@ -244,15 +279,16 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 ## 审计时间线（batch timeline，只读）
 
-`batch create`、`start`、`report`、`check`、`abort`、`rollback-report`、`pause`、
-`resume` 成功后向批次追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态
+`batch create`、`start`、`report`、`check`、`abort`、`rollback-report`、
+`rollback-retry`、`pause`、`resume` 成功后向批次追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态
 均不追加，历史事件只增不改。
 事件字段：`sequence`（从 1 起严格递增）、`type`、`occurredAt`、`batchIndex`、
 `deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason`，未涉及的字段为 `null`。
 
 - `type` 取值：`created`、`started`、`batch_opened`、`upgrade_reported`、
   `timeout_recorded`、`batch_advanced`、`stopped`、`rollback_started`、
-  `rollback_reported`、`rollback_timed_out`、`aborted`、`paused`、`resumed`、`finished`。
+  `rollback_reported`、`rollback_timed_out`、`rollback_retry_started`、
+  `aborted`、`paused`、`resumed`、`finished`。
 - `occurredAt` 取显式 `--at`、调用时刻或心跳时刻，统一为 ISO 8601 UTC `Z` 后缀。
 - `batch check` 越过观察期截止时刻推进下一批时追加 `batch_advanced`，末批完成时
   追加 `finished`，`occurredAt` 取该次 `--at`；观察期内未越过截止时刻、且未补出
