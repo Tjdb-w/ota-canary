@@ -29,9 +29,13 @@
   at 严格晚于截止时刻时，把 pending 回滚任务收束为 failure(reason=timeout)、设备
   阶段置为 rollback_failed（版本与心跳不变），逐台追加 rollback_timed_out 事件并
   按 device-id 升序返回 rollbackExpiredDeviceIds；重复 check 不重复变更。
-- 审计时间线：create/start/report/check/abort/rollback-report/pause/resume 成功后
-  向批次追加严格递增事件（失败、幂等重复、冲突/迟到不追加，历史只增不改），
-  ``batch timeline`` 只读查询，支持 --after-sequence 与 --limit 分页。
+- 失败回滚再试 ``batch rollback-retry``：仅 rollback_failed 批次可用，指定设备的
+  最新回滚须为 failure（含 reason=timeout）且从未成功；成功后设备回到 rolling_back、
+  批次回到 failed_stopped 且 frozen，版本与心跳不变，rollbackDeadline 重置为
+  at + rollbackTimeoutSeconds，再试结果仍走 rollback-report 与 check 超时收束。
+- 审计时间线：create/start/report/check/abort/rollback-report/rollback-retry/
+  pause/resume 成功后向批次追加严格递增事件（失败、幂等重复、冲突/迟到不追加，
+  历史只增不改），``batch timeline`` 只读查询，支持 --after-sequence 与 --limit 分页。
 
 仅使用 Python 3 标准库。
 """
@@ -116,6 +120,7 @@ EVENT_PAUSED = "paused"
 EVENT_RESUMED = "resumed"
 EVENT_FINISHED = "finished"
 EVENT_ROLLBACK_TIMED_OUT = "rollback_timed_out"
+EVENT_ROLLBACK_RETRY_STARTED = "rollback_retry_started"
 
 # 回滚收束时限缺省秒数（旧状态缺 rollbackTimeoutSeconds 时按此解释）
 DEFAULT_ROLLBACK_TIMEOUT_SECONDS = 900
@@ -369,6 +374,8 @@ def cmd_batch_create(state, args):
         "currentBatch": None,
         "currentBatchStartedAt": None,
         "devices": {},
+        "retryDeviceIds": [],
+        "retryStartedAt": None,
         "events": [],
     }
     rollouts(state)[batch_id] = rollout
@@ -989,16 +996,20 @@ def finalize_rollback_if_done(rollout, converge_empty=False, at_instant=None):
 
     converge_empty 为 True（显式收批入口）时，没有任何回滚任务也收束为
     rolled_back；否则空集合保留 failed_stopped，保证停止状态外部可见。
-    收束为终态（rolled_back/rollback_failed）时追加 finished 审计事件。
+    收束为终态（rolled_back/rollback_failed）时追加 finished 审计事件；
+    rollback-retry 之后的收束属于再试周期，只决定状态，不再追加 finished。
     """
     if rollout["status"] != STATUS_FAILED_STOPPED:
         return
     records = [e["rollback"] for e in rollout["devices"].values() if e["rollback"] is not None]
+    # 首次回滚周期（从未执行过 rollback-retry）收束时记 finished；再试周期不记。
+    emit_finished = rollout.get("retryStartedAt") is None
     if not records:
         if converge_empty:
             rollout["status"] = STATUS_ROLLED_BACK
-            append_event(rollout, EVENT_FINISHED, at_instant,
-                         phase_from=STATUS_FAILED_STOPPED, phase_to=STATUS_ROLLED_BACK)
+            if emit_finished:
+                append_event(rollout, EVENT_FINISHED, at_instant,
+                             phase_from=STATUS_FAILED_STOPPED, phase_to=STATUS_ROLLED_BACK)
         return
     if any(r["state"] == "pending" for r in records):
         return
@@ -1007,8 +1018,9 @@ def finalize_rollback_if_done(rollout, converge_empty=False, at_instant=None):
         if any(r["state"] == "failure" for r in records)
         else STATUS_ROLLED_BACK
     )
-    append_event(rollout, EVENT_FINISHED, at_instant,
-                 phase_from=STATUS_FAILED_STOPPED, phase_to=rollout["status"])
+    if emit_finished:
+        append_event(rollout, EVENT_FINISHED, at_instant,
+                     phase_from=STATUS_FAILED_STOPPED, phase_to=rollout["status"])
 
 
 # ---------------------------------------------------------------------------
@@ -1068,6 +1080,98 @@ def cmd_batch_rollback_report(state, args):
     view["report"] = {"deviceId": device_id, "result": result,
                       "heartbeatAt": heartbeat_text, "idempotent": False}
     return view
+
+
+# ---------------------------------------------------------------------------
+# 失败回滚的再试（rollback-retry）
+# ---------------------------------------------------------------------------
+
+def require_retry_device_ids(values):
+    """再试设备集合：至少一个；空值或重复返回 InvalidArgument。"""
+    if not values:
+        raise cli.InvalidArgument("at least one --device-id is required")
+    seen = set()
+    ids = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise cli.InvalidArgument("device-id must be a non-empty string: %r" % (value,))
+        device_id = value.strip()
+        if device_id in seen:
+            raise cli.InvalidArgument("duplicate device-id: %s" % device_id)
+        seen.add(device_id)
+        ids.append(device_id)
+    return sorted(ids)
+
+
+def cmd_batch_rollback_retry(state, args):
+    """对 rollback_failed 批次中失败（failure/timeout）的回滚任务再试一次。
+
+    全部校验通过前不写任何状态：批次必须存在且为 rollback_failed；设备至少一个、
+    不重复且按升序处理；设备必须属批次，且其最新一次回滚为 failure 或 timeout
+    （无 success 终态）。成功后设备回到 rolling_back、批次回到 failed_stopped 并
+    保持 frozen；版本与心跳不变，rollbackDeadline 重置为 at + 策略秒数。
+    """
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    reason = cli.require_abort_reason(args.reason)
+    _, at_instant = cli.require_time(args.at)
+    device_ids = require_retry_device_ids(getattr(args, "device_id", None))
+    rollout = get_rollout(state, batch_id)
+    if rollout["status"] != STATUS_ROLLBACK_FAILED:
+        raise cli.InvalidState(
+            "batch %s is not rollback_failed (status: %s)" % (batch_id, rollout["status"])
+        )
+    entries = rollout["devices"]
+    # 先做只读校验：存在性与归属、最新回滚为 failure（含 reason=timeout）且无 success。
+    for device_id in device_ids:
+        entry = entries.get(device_id)
+        if entry is None:
+            cli.get_device(state, device_id)  # 未登记设备沿用 DeviceNotFound
+            raise cli.InvalidArgument(
+                "device %s is not part of batch %s" % (device_id, batch_id)
+            )
+        record = entry.get("rollback")
+        if record is None or record.get("state") == "pending":
+            raise cli.InvalidArgument(
+                "device %s has no failed rollback to retry in batch %s" % (device_id, batch_id)
+            )
+        if record.get("state") == "success":
+            raise cli.InvalidArgument(
+                "device %s rollback already succeeded in batch %s" % (device_id, batch_id)
+            )
+    # 校验全过：归档每次失败回滚（state/result/reason/heartbeatAt/version 依序保留，
+    # 不覆盖历史），再重新派发 pending 任务。按 device-id 升序处理与追加事件。
+    retried = []
+    for device_id in device_ids:
+        entry = entries[device_id]
+        record = entry["rollback"]
+        attempts = entry.setdefault("rollbackAttempts", [])
+        attempts.append({
+            "state": record.get("state"),
+            "result": record.get("state"),
+            "reason": record.get("reason"),
+            "heartbeatAt": record.get("heartbeatAt"),
+            "version": record.get("version"),
+        })
+        entry["rollback"] = {
+            "state": "pending", "heartbeatAt": None, "version": None, "reason": None,
+        }
+        entry["phase"] = PHASE_ROLLING_BACK
+        append_event(rollout, EVENT_ROLLBACK_RETRY_STARTED, at_instant,
+                     batch_index=entry["batchIndex"], device_id=device_id,
+                     phase_from=PHASE_ROLLBACK_FAILED, phase_to=PHASE_ROLLING_BACK,
+                     reason=reason)
+        retried.append(device_id)
+    rollout["status"] = STATUS_FAILED_STOPPED
+    rollout["frozen"] = True
+    rollout["retryDeviceIds"] = retried
+    rollout["retryStartedAt"] = cli.format_instant(at_instant)
+    timeout_seconds = rollout.get(
+        "rollbackTimeoutSeconds", DEFAULT_ROLLBACK_TIMEOUT_SECONDS
+    )
+    rollout["rollbackDeadline"] = cli.format_instant(
+        at_instant + timedelta(seconds=timeout_seconds)
+    )
+    return batch_view(state, rollout, at_instant=at_instant)
 
 
 # ---------------------------------------------------------------------------
@@ -1151,6 +1255,19 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
             rollback_record.setdefault(
                 "reason", "reported" if state_name == "failure" else None
             )
+        # rollback-retry 归档的历次失败回滚依序保留，超时次数跨再试累计。
+        attempts = []
+        for attempt in entry.get("rollbackAttempts") or []:
+            if isinstance(attempt, dict) and attempt.get("reason") == "timeout":
+                rollback_timed_out += 1
+            if isinstance(attempt, dict):
+                attempts.append({
+                    "state": attempt.get("state"),
+                    "result": attempt.get("result"),
+                    "reason": attempt.get("reason"),
+                    "heartbeatAt": attempt.get("heartbeatAt"),
+                    "version": attempt.get("version"),
+                })
         device = state["devices"].get(device_id, {})
         devices.append({
             "deviceId": device_id,
@@ -1161,6 +1278,7 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
             "lastHeartbeatAt": entry.get("lastHeartbeatAt"),
             "terminal": terminal,
             "rollback": rollback_record,
+            "rollbackAttempts": attempts,
         })
 
     view = {
@@ -1179,6 +1297,9 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
             "rollbackTimeoutSeconds", DEFAULT_ROLLBACK_TIMEOUT_SECONDS
         ),
         "rollbackDeadline": rollout.get("rollbackDeadline"),
+        # rollback-retry：前两项记最近一次再试，从未再试或缺字段的旧状态为 [] / null。
+        "retryDeviceIds": list(rollout.get("retryDeviceIds") or []),
+        "retryStartedAt": rollout.get("retryStartedAt"),
         "targetDeviceIds": list(rollout["targetDeviceIds"]),
         "status": rollout["status"],
         "frozen": rollout["frozen"],
@@ -1432,6 +1553,18 @@ def register_parsers(subparsers, add_state_option):
                                 help="回传时刻设备当前固件版本（可选）")
     batch_rollback.set_defaults(handler=cmd_batch_rollback_report, mutating=True)
     add_state_option(batch_rollback)
+
+    batch_rollback_retry = batch_sub.add_parser(
+        "rollback-retry",
+        help="对 rollback_failed 批次中失败（failure/timeout）的回滚再试一次")
+    batch_rollback_retry.add_argument("--batch-id", required=True)
+    batch_rollback_retry.add_argument("--device-id", action="append", default=None,
+                                      help="再试设备，可重复；至少一个且不得重复，按升序处理")
+    batch_rollback_retry.add_argument("--reason", required=True,
+                                      help="再试原因，去除首尾空白后 1 到 200 个 Unicode 字符")
+    batch_rollback_retry.add_argument("--at", required=True, help="再试开始时刻（ISO 8601）")
+    batch_rollback_retry.set_defaults(handler=cmd_batch_rollback_retry, mutating=True)
+    add_state_option(batch_rollback_retry)
 
     batch_status = batch_sub.add_parser("status", help="查询批次灰度状态（只读）")
     batch_status.add_argument("--batch-id", required=True)
