@@ -346,19 +346,33 @@ def cmd_release_create(state, args):
     return release_view(state, release)
 
 
+def release_occupied_device_ids(state):
+    """in_progress/paused 发布持续占用的设备集合：其已纳入批次的目标设备。
+
+    pending 发布尚未建批不占用；completed/rolled_back 释放占用。
+    与批次灰度子系统的占用口径共同构成跨子系统统一占用视图。
+    """
+    occupied = set()
+    for other in state["releases"].values():
+        if other.get("status") in ("in_progress", "paused"):
+            for batch in other.get("batches", []):
+                occupied.update(batch)
+    return occupied
+
+
 def compute_release_candidates(state, release):
     """按 release start 的口径只读计算候选设备。
 
     返回 (targetDeviceIds, eligible)：targetDeviceIds 为 None 表示未指定定向；
     显式目标先校验全部存在（DeviceNotFound），再校验版本与占用（InvalidArgument）。
     eligible 已按 device-id 升序（显式目标集合在 create 时已排序）。
+    占用为跨子系统统一口径：本系统 in_progress/paused 发布的批次设备，加上
+    批次灰度 in_progress/paused/failed_stopped 批次已纳入的目标设备。
     """
     target_device_ids = release.get("targetDeviceIds")
-    occupied = set()
-    for other in state["releases"].values():
-        if other["status"] in ("in_progress", "paused"):
-            for batch in other["batches"]:
-                occupied.update(batch)
+    from . import batch_rollout
+    occupied = release_occupied_device_ids(state)
+    occupied.update(batch_rollout.batch_occupied_device_ids(state))
     if target_device_ids is not None:
         # 显式目标：先确认全部存在（DeviceNotFound），再确认版本与占用（InvalidArgument）。
         for device_id in target_device_ids:
@@ -373,7 +387,7 @@ def compute_release_candidates(state, release):
                 )
             if device_id in occupied:
                 raise InvalidArgument(
-                    "target device %s is occupied by another in_progress or paused release"
+                    "target device %s is occupied by another active release or batch rollout"
                     % device_id
                 )
         return target_device_ids, list(target_device_ids)

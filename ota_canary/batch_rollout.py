@@ -451,11 +451,26 @@ def cmd_batch_create(state, args):
 # 启动前资格预检（batch plan 与 batch start 共用同一只读口径）
 # ---------------------------------------------------------------------------
 
-def occupied_device_ids(state, rollout):
-    """其他仍占用设备的发布：in_progress、paused 与 failed_stopped。
+def batch_occupied_device_ids(state):
+    """in_progress、paused、failed_stopped 批次持续占用的设备集合。
 
-    completed、rolled_back、rollback_failed 释放占用；pending 发布尚未建批，
-    也不占用。占用集合取占用发布创建时确定的去重目标设备集。
+    completed、rolled_back、rollback_failed 释放占用；pending 批次尚未建批
+    也不占用。占用集合取占用批次启动时确定并纳入批次的目标设备集。
+    """
+    occupied = set()
+    for other in rollouts(state).values():
+        if other.get("status") not in OCCUPYING_STATUSES:
+            continue
+        occupied.update(other.get("targetDeviceIds", ()))
+    return occupied
+
+
+def occupied_device_ids(state, rollout):
+    """其他仍占用设备的发布（跨子系统统一口径）。
+
+    本系统内：in_progress、paused 与 failed_stopped 批次占用其目标设备；
+    跨子系统：in_progress、paused 的 release 占用其已纳入批次的设备。
+    completed、rolled_back、rollback_failed 释放占用，pending 不占用。
     """
     occupied = set()
     for other in rollouts(state).values():
@@ -464,6 +479,7 @@ def occupied_device_ids(state, rollout):
         if other.get("status") not in OCCUPYING_STATUSES:
             continue
         occupied.update(other.get("targetDeviceIds", ()))
+    occupied.update(cli.release_occupied_device_ids(state))
     return occupied
 
 

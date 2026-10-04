@@ -151,6 +151,19 @@ python -m ota_canary fleet status \
   发布不存在返回 `DeviceNotFound`。
 - 其他发布选择设备时尊重暂停中的发布：`paused` 发布已占用的设备不会被新的
   `release start` 纳入候选；设备占用在发布进入 `completed` 或 `rolled_back` 后解除。
+- 跨子系统设备占用协调：占用按统一口径计算——状态为 `in_progress` 或 `paused`
+  的 release 持续占用其已纳入批次的目标设备；状态为 `in_progress`、`paused` 或
+  `failed_stopped` 的 batch rollout 持续占用其已纳入批次的目标设备；`pending`、
+  `completed`、`rolled_back`、`rollback_failed` 均不占用。`release plan` 与
+  `release start` 在原有同子系统检查之外排除被 batch rollout 占用的设备：未指定
+  目标时只从候选中排除；显式指定目标时先对全部目标做存在性检查
+  （`DeviceNotFound`），再按原有顺序检查版本和占用，任何跨子系统冲突返回
+  `InvalidArgument`，且不创建批次、不写 reports、不改变设备。`batch plan` 使用
+  同一口径，在 `eligibleDeviceIds` 与 `batches` 中排除被 release 占用的设备，
+  并在 `ineligibleDevices` 中给出唯一原因 `DEVICE_BUSY`（版本不符仍为
+  `VERSION_MISMATCH` 且优先）；`batch start` 沿用计划结果，任一目标不合格返回
+  `InvalidBatchEligibility`，全部校验通过才建立设备阶段。已经运行中的发布不受
+  影响，待其进入释放占用的终态后，其他子系统才可选择这些设备。
 - `release abort` 是人工止损入口，仅接受 `in_progress` 或 `paused` 发布：状态改为
   `rolled_back`，`stopReason` 为 `manual_abort`，`abortReason` 为去除首尾空白后的
   `--reason`，`abortedAt` 为 `--at` 按 UTC 规范输出的 `Z` 时间；所有批次内设备
