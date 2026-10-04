@@ -14,12 +14,13 @@
 python -m ota_canary firmware register --version 2.0.0
 python -m ota_canary firmware list
 
-# 创建批次发布
+# 创建批次发布（--canary-device-id 可重复，指定金丝雀设备确定进入首批）
 python -m ota_canary batch create \
     --batch-id B1 --target-version 2.0.0 --stable-version 1.0.0 \
     --batch-size 2 --failure-threshold 0.5 --heartbeat-timeout-seconds 900 \
     --stabilization-seconds 300 \
-    --target-device-id d1 --target-device-id d2 --target-device-id d3
+    --target-device-id d1 --target-device-id d2 --target-device-id d3 \
+    --canary-device-id d3
 
 # 开始放量：仅把第一批设备置为 pending_upgrade
 # 启动前可先做只读资格预检（不改变任何状态）
@@ -81,6 +82,28 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 `batch create --rollback-timeout-seconds` 为可选参数，取大于等于 1 的整数，缺省
 `900`；非法值返回 `InvalidBatchPolicy` 且不写状态。该策略用于回滚收束时限（见下节）。
+
+## 金丝雀设备优先放量（--canary-device-id）
+
+- `batch create` 支持可重复的 `--canary-device-id`，让关键设备确定进入首批。
+  未提供时 `canaryDeviceIds` 为 `[]`，仍整体按 device-id 升序切批。
+- 校验（均发生在任何状态写入前，失败不创建批次、不改状态）：
+  - 值须为去首尾空白后非空字符串，且同一命令内不重复；空值或重复返回
+    `InvalidArgument`；
+  - 每个金丝雀设备都必须出现在同一命令的 `--target-device-id` 集合中，否则返回
+    `InvalidArgument`；
+  - 金丝雀数量不得超过 `batch-size`，超过返回 `InvalidBatchPolicy`；
+  - 金丝雀设备随目标集合一并做存在性校验，未登记返回 `DeviceNotFound`。
+- 分批口径：金丝雀设备按 device-id 升序排在第一批最前，第一批未满时用非金丝雀
+  设备按 device-id 升序补足，其余目标设备按 device-id 升序组成后续批次。
+  `batch plan` 与 `batch start` 使用完全相同的资格、分组与排序口径；不合格的
+  金丝雀设备仍按既有规则出现在 `ineligibleDevices`，其余合格金丝雀依旧排在首批
+  最前。
+- 视图：`batch create`、`batch plan`、`batch start` 成功响应返回
+  `canaryDeviceIds`（按 device-id 升序）；`plan` 仍只读。`batch status` 顶层
+  返回 `canaryDeviceIds`（旧状态缺字段时为 `[]`，只读不补写），`devices` 每项
+  增加 `canary` 布尔字段（旧状态为 `false`），仅标记金丝雀身份，不改变 `phase`、
+  `terminal`、`rollback`、`failureRate`、占用与错误语义。
 
 ## 回滚收束时限（rollback-timeout-seconds）
 
@@ -153,7 +176,7 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 - 对 `pending` 发布执行 `batch plan --batch-id B1 [--at 时间]` 做只读预检，
   输出 `batchId`、`targetVersion`、`stableVersion`、`batchSize`、`targetDeviceIds`、
-  `eligibleDeviceIds`、`ineligibleDevices`、`candidateCount`、`batches`。
+  `canaryDeviceIds`、`eligibleDeviceIds`、`ineligibleDevices`、`candidateCount`、`batches`。
 - `targetDeviceIds` 取创建时去重集合并按 device-id 升序。
 - 合格条件：设备当前版本等于 `stableVersion`，且未被**其他**处于
   `in_progress`、`paused` 或 `failed_stopped` 的发布占用；`completed`、
@@ -246,6 +269,8 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 `batch status` 顶层还返回：`completedCount`、`failedCount`、`reportedCount`、
 `currentBatchReportedCount`、`failureRate`（当前推进批次已取得终态设备中的失败占比，
 无终态时为 `null`）、`currentBatch`、`frozen`（后续批次是否已冻结）、
+`canaryDeviceIds`（创建时指定的金丝雀设备，按 device-id 升序；未指定与旧状态
+缺字段时为 `[]`，只读不补写）、
 `paused`（当前是否处于暂停）、`pausedAt`/`resumedAt`（最近一次暂停/恢复时刻，
 从未暂停或对应动作未发生时为 `null`；再次暂停会把 `resumedAt` 重新置空）、
 `stabilizationSeconds`（策略值，旧状态显示 `0`）、`stabilizationDeadline`
@@ -258,7 +283,9 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 `[]`/`null`）、`rollbackAttempts`（被重试取代的失败回滚尝试，依序保留
 `state`/`result`/`reason`/`heartbeatAt`/`version`，只增不覆盖，缺省 `[]`）、
 `phaseCounts`、
-回滚计数（`rollbackTotal/Pending/Succeeded/Failed`）与逐设备 `devices[]`。
+回滚计数（`rollbackTotal/Pending/Succeeded/Failed`）与逐设备 `devices[]`
+（每项含 `canary` 布尔字段，仅标记金丝雀身份；未指定金丝雀的批次与旧状态均为
+`false`，不改变阶段、终态、回滚、失败率与占用语义）。
 每条回滚记录含 `state`（`pending`/`success`/`failure`）、`heartbeatAt`、`version`
 与 `reason`（成功为 `null`、设备回传的失败为 `reported`、超时收束为 `timeout`；
 旧记录缺 `reason` 时按状态推导显示，只读不补写）。
