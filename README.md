@@ -70,17 +70,21 @@ python -m ota_canary fleet status \
   结果数（含显式上报与超时补写结果），`failedCount` 为其中 `result=failure` 的数量；
   `stopReason` 在逐批回滚时为 `batch_failure_threshold`、累计回滚时为
   `release_failure_threshold`，未回滚或旧状态原因不明时为 `null`。
-- 启动发布时，仅选择 `currentVersion == previousVersion` 且未被进行中发布占用的设备，
-  按 `device-id` 升序分批；空匹配的发布直接 `completed`。
+- 启动发布时，仅选择 `currentVersion == previousVersion` 且未被跨子系统占用的设备，
+  按 `device-id` 升序分批；空匹配的发布直接 `completed`。跨子系统占用按统一口径计算：
+  状态为 `in_progress`/`paused` 的 release，以及状态为 `in_progress`/`paused`/
+  `failed_stopped` 的 batch rollout，都持续占用其已经纳入批次的目标设备；
+  `pending`、`completed`、`rolled_back`、`rollback_failed` 不占用。
 - `release plan --release-id <id>` 是 pending 发布的只读分批预览，沿用 `--state`、
   `release create` 的目标集合与 `release start` 的候选/分批语义（同一套计算），但
   不创建批次、reports，不改设备版本、心跳、占用关系或状态文件，重复调用结果稳定。
   成功输出字段固定为 `releaseId`、`targetDeviceIds`、`eligibleDeviceIds`、`batchSize`、
   `candidateCount`、`batches`：`targetDeviceIds` 显式定向时按 device-id 升序返回目标
   集合，否则为 `null`；`eligibleDeviceIds` 升序仅含当前版本等于 `previousVersion` 且
-  未被 `in_progress`/`paused` 发布占用的设备；`candidateCount` 为其数量；`batches`
-  按 `batchSize` 切分，空候选为 `[]`。显式目标任一不存在返回 `DeviceNotFound`；其余
-  目标版本不等于 `previousVersion` 或被其他进行中/暂停发布占用返回 `InvalidArgument`，
+  未被跨子系统占用（`in_progress`/`paused` 的 release 或 `in_progress`/`paused`/
+  `failed_stopped` 的 batch rollout 已纳入批次的设备）的设备；`candidateCount` 为其数量；
+  `batches` 按 `batchSize` 切分，空候选为 `[]`。显式目标任一不存在返回 `DeviceNotFound`；其余
+  目标版本不等于 `previousVersion` 或被跨子系统占用返回 `InvalidArgument`，
   且成功校验前不输出计划；存在性先于版本与占用校验。显式目标为空列表时
   `eligibleDeviceIds` 与 `batches` 均为空。发布不存在返回 `DeviceNotFound`；对非
   `pending` 发布执行返回 `InvalidState`。错误走 stderr JSON 且退出码非零；`status`
@@ -92,13 +96,14 @@ python -m ota_canary fleet status \
   发布。发布视图含 `targetDeviceIds`：显式指定时按 device-id 升序返回目标集合；未指定或
   读取缺少该字段的旧状态时为 `null`，旧发布继续采用全量选择行为，且不重写历史记录。
 - 定向发布启动时，`release start` 只在目标集合内选择 `currentVersion == previousVersion`
-  且未被 `in_progress`/`paused` 发布占用的设备，仍按 device-id 升序分批；目标集合本身已
+  且未被跨子系统占用的设备，仍按 device-id 升序分批；目标集合本身已
   排序，故批次顺序确定。目标设备不存在返回 `DeviceNotFound`；目标设备存在但版本不等于
-  `previousVersion`，或正被其他进行中/暂停发布占用，返回 `InvalidArgument`。存在性先于
-  版本与占用校验。这些启动失败都不修改发布状态、批次、报告、设备版本、心跳或占用关系
-  （发布仍为 `pending`、`batches` 为空）。非空目标集合要求全部合法，因此校验通过即有
-  成员；当目标集合为空（如状态中记录为空列表，目标合法性空真）时，发布直接 `completed`，
-  与全量选择下的空匹配结果一致。
+  `previousVersion`，或正被跨子系统占用（in_progress/paused 的 release，或
+  in_progress/paused/failed_stopped 的 batch rollout 已纳入批次的设备），返回
+  `InvalidArgument`。存在性先于版本与占用校验。这些启动失败都不修改发布状态、批次、报告、
+  设备版本、心跳或占用关系（发布仍为 `pending`、`batches` 为空）。非空目标集合要求全部
+  合法，因此校验通过即有成员；当目标集合为空（如状态中记录为空列表，目标合法性空真）时，
+  发布直接 `completed`，与全量选择下的空匹配结果一致。
 - 定向发布启动后，`device report`、`release check` 的超时判定、逐批失败率、可选的发布级
   累计失败率、`stabilization-seconds` 观察推进、`pause`/`resume`/`abort`、`status` 的
   既有字段与结果语义保持不变；迟到报告、设备占用解除、非零退出码、stderr JSON 错误以及
@@ -149,8 +154,12 @@ python -m ota_canary fleet status \
   `device heartbeat` 按既有规则工作。对 `pending`/`completed`/`rolled_back`
   发布执行 pause，或对非 `paused` 发布执行 resume，均返回 `InvalidState`；
   发布不存在返回 `DeviceNotFound`。
-- 其他发布选择设备时尊重暂停中的发布：`paused` 发布已占用的设备不会被新的
-  `release start` 纳入候选；设备占用在发布进入 `completed` 或 `rolled_back` 后解除。
+- 其他发布选择设备时尊重占用中的发布：`paused` 的 release、以及
+  `in_progress`/`paused`/`failed_stopped` 的 batch rollout 已纳入批次的设备，都不会被新的
+  `release plan`/`release start` 纳入候选（batch plan/batch start 使用同一跨子系统口径）。
+  release 占用在进入 `completed` 或 `rolled_back` 后解除；batch rollout 占用在进入
+  `completed`、`rolled_back` 或 `rollback_failed` 后解除；待其进入释放占用的终态后，
+  其他子系统才可选择这些设备。
 - `release abort` 是人工止损入口，仅接受 `in_progress` 或 `paused` 发布：状态改为
   `rolled_back`，`stopReason` 为 `manual_abort`，`abortReason` 为去除首尾空白后的
   `--reason`，`abortedAt` 为 `--at` 按 UTC 规范输出的 `Z` 时间；所有批次内设备

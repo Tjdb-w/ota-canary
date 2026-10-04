@@ -20,6 +20,56 @@ DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 900
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 VALID_RESULTS = ("success", "failure")
 
+# ---------------------------------------------------------------------------
+# 跨子系统设备占用（release 与 batch rollout 统一口径）
+# ---------------------------------------------------------------------------
+
+# release 持续占用已纳入批次设备的状态
+RELEASE_OCCUPYING_STATUSES = ("in_progress", "paused")
+
+# batch rollout 持续占用已纳入批次设备的状态
+BATCH_OCCUPYING_STATUSES = ("in_progress", "paused", "failed_stopped")
+
+
+def release_batch_device_ids(release):
+    """release 已经纳入批次（batches）的设备集合（跨批去重）。"""
+    ids = set()
+    for batch in release.get("batches", ()):
+        ids.update(batch)
+    return ids
+
+
+def rollout_batch_device_ids(rollout):
+    """batch rollout 已经纳入批次（batches）的设备集合（跨批去重）。"""
+    ids = set()
+    for batch in rollout.get("batches", ()):
+        ids.update(batch)
+    return ids
+
+
+def unified_occupied_device_ids(state):
+    """按统一口径只读计算跨子系统设备占用集合。
+
+    状态为 in_progress/paused 的 release，以及状态为 in_progress/paused/
+    failed_stopped 的 batch rollout，都持续占用其已经纳入批次（batches）的
+    目标设备；pending（尚未建批）、completed、rolled_back、rollback_failed
+    不占用。release plan/start 与 batch plan/start 共用本函数。
+    """
+    occupied = set()
+    releases = state.get("releases")
+    if isinstance(releases, dict):
+        for release in releases.values():
+            if isinstance(release, dict) \
+                    and release.get("status") in RELEASE_OCCUPYING_STATUSES:
+                occupied.update(release_batch_device_ids(release))
+    rollouts = state.get("batchRollouts")
+    if isinstance(rollouts, dict):
+        for rollout in rollouts.values():
+            if isinstance(rollout, dict) \
+                    and rollout.get("status") in BATCH_OCCUPYING_STATUSES:
+                occupied.update(rollout_batch_device_ids(rollout))
+    return occupied
+
 
 # ---------------------------------------------------------------------------
 # 错误类型：业务错误以 JSON 形式输出到 stderr，退出码为 1
@@ -350,15 +400,14 @@ def compute_release_candidates(state, release):
     """按 release start 的口径只读计算候选设备。
 
     返回 (targetDeviceIds, eligible)：targetDeviceIds 为 None 表示未指定定向；
-    显式目标先校验全部存在（DeviceNotFound），再校验版本与占用（InvalidArgument）。
+    显式目标先校验全部存在（DeviceNotFound），再按原顺序校验版本与占用
+    （InvalidArgument）。占用按跨子系统统一口径（unified_occupied_device_ids）：
+    in_progress/paused 的 release 与 in_progress/paused/failed_stopped 的
+    batch rollout 已纳入批次的设备均占用。
     eligible 已按 device-id 升序（显式目标集合在 create 时已排序）。
     """
     target_device_ids = release.get("targetDeviceIds")
-    occupied = set()
-    for other in state["releases"].values():
-        if other["status"] in ("in_progress", "paused"):
-            for batch in other["batches"]:
-                occupied.update(batch)
+    occupied = unified_occupied_device_ids(state)
     if target_device_ids is not None:
         # 显式目标：先确认全部存在（DeviceNotFound），再确认版本与占用（InvalidArgument）。
         for device_id in target_device_ids:
@@ -373,7 +422,8 @@ def compute_release_candidates(state, release):
                 )
             if device_id in occupied:
                 raise InvalidArgument(
-                    "target device %s is occupied by another in_progress or paused release"
+                    "target device %s is occupied by another in_progress or paused "
+                    "release, or an in_progress, paused or failed_stopped batch rollout"
                     % device_id
                 )
         return target_device_ids, list(target_device_ids)
@@ -759,7 +809,9 @@ def build_parser():
     release_create.add_argument("--target-device-id", action="append",
                                 default=argparse.SUPPRESS,
                                 help="定向发布目标设备，可重复；启动时只在这些设备中选择，"
-                                     "均须版本等于 previous-version 且未被进行中/暂停发布占用")
+                                     "均须版本等于 previous-version 且未被跨子系统占用"
+                                     "（in_progress/paused 的 release 或 in_progress/paused/"
+                                     "failed_stopped 的 batch rollout 已纳入批次的设备）")
     release_create.set_defaults(handler=cmd_release_create, mutating=True)
     add_state_option(release_create)
 

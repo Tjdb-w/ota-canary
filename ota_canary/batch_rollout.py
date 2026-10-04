@@ -7,9 +7,10 @@
 - 新增 ``firmware register|list`` 与 ``batch create|plan|start|report|check|
   pause|resume|rollback-report|rollback-retry|abort|status`` 命令，不改变既有命令的请求/响应；
 - ``batch plan`` 对 pending 发布做只读启动资格预检，``batch start`` 复用同一口径：
-  仅当前版本等于 stableVersion 且未被其他 in_progress/paused/failed_stopped
-  发布占用的设备
-  合格，任一不合格即拒绝启动，全部合格时仅第一批置为 pending_upgrade；
+  仅当前版本等于 stableVersion 且未被跨子系统统一口径占用的设备合格——
+  in_progress/paused 的 release，或其他 in_progress/paused/failed_stopped
+  的 batch rollout 已纳入批次的设备均占用（release plan/start 使用同一口径）；
+  任一不合格即拒绝启动，全部合格时仅第一批置为 pending_upgrade；
 - ``batch create --canary-device-id``（可重复）指定金丝雀设备：须非空、不重复、
   属于同一命令的 target-device-id 且数量不超过 batch-size；金丝雀按 device-id
   升序进入第一批，非金丝雀按同序补足，其余目标按同序组成后续批次；未指定时
@@ -109,10 +110,6 @@ PHASE_ROLLBACK_SUCCEEDED = "rollback_succeeded"      # 回滚成功
 PHASE_ROLLBACK_FAILED = "rollback_failed"            # 回滚失败
 
 TERMINAL_PHASES = (PHASE_SUCCESS, PHASE_FAILED)
-
-# 占用设备的发布状态：in_progress、paused 与 failed_stopped 占用；
-# completed、rolled_back、rollback_failed 均释放。
-OCCUPYING_STATUSES = (STATUS_IN_PROGRESS, STATUS_PAUSED, STATUS_FAILED_STOPPED)
 
 # 审计时间线事件类型
 EVENT_CREATED = "created"
@@ -452,18 +449,16 @@ def cmd_batch_create(state, args):
 # ---------------------------------------------------------------------------
 
 def occupied_device_ids(state, rollout):
-    """其他仍占用设备的发布：in_progress、paused 与 failed_stopped。
+    """跨子系统统一占用口径下、被其他发布占用的设备集合。
 
-    completed、rolled_back、rollback_failed 释放占用；pending 发布尚未建批，
-    也不占用。占用集合取占用发布创建时确定的去重目标设备集。
+    release 状态为 in_progress/paused，或 batch rollout 状态为
+    in_progress/paused/failed_stopped 时，持续占用其已经纳入批次（batches）
+    的目标设备；completed、rolled_back、rollback_failed 释放占用，pending
+    发布尚未建批也不占用。本函数委托 cli.unified_occupied_device_ids 计算并
+    剔除当前批次自身（pending 预检时自身尚未建批、本不在集合中）。
     """
-    occupied = set()
-    for other in rollouts(state).values():
-        if other is rollout:
-            continue
-        if other.get("status") not in OCCUPYING_STATUSES:
-            continue
-        occupied.update(other.get("targetDeviceIds", ()))
+    occupied = cli.unified_occupied_device_ids(state)
+    occupied.difference_update(cli.rollout_batch_device_ids(rollout))
     return occupied
 
 
@@ -472,7 +467,9 @@ def evaluate_eligibility(state, rollout):
 
     返回 (target_ids, eligible_ids, ineligible, batches)：
     - target_ids 为创建时去重集合，按 device-id 升序；
-    - 当前版本等于 stableVersion 且未被其他 in_progress/failed_stopped 发布占用者合格；
+    - 当前版本等于 stableVersion 且未被跨子系统统一口径占用者合格：
+      in_progress/paused 的 release 或 in_progress/paused/failed_stopped 的
+      其他 batch rollout 已纳入批次的设备均占用；
     - 版本不符与占用兼一时 VERSION_MISMATCH 优先；
     - batches 只含合格设备并按 batchSize 切分，无合格设备时为 []；
     - 金丝雀（创建时登记的 canaryDeviceIds）按 device-id 升序进入第一批，

@@ -172,9 +172,11 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   `canaryDeviceIds`、`eligibleDeviceIds`、`ineligibleDevices`、`candidateCount`、`batches`。
 - `targetDeviceIds` 取创建时去重集合并按 device-id 升序；`canaryDeviceIds` 取创建时
   登记的金丝雀集合（升序），旧状态缺字段时显示 `[]`。
-- 合格条件：设备当前版本等于 `stableVersion`，且未被**其他**处于
-  `in_progress`、`paused` 或 `failed_stopped` 的发布占用；`completed`、
-  `rolled_back`、`rollback_failed` 释放占用，`pending` 发布尚未建批也不占用。
+- 合格条件：设备当前版本等于 `stableVersion`，且未被跨子系统统一口径占用——
+  状态为 `in_progress`/`paused` 的 release，或**其他**处于 `in_progress`、`paused`、
+  `failed_stopped` 的 batch rollout，已纳入其批次的设备均占用（release plan/start
+  使用同一口径）；`completed`、`rolled_back`、`rollback_failed` 释放占用，`pending`
+  发布尚未建批也不占用。占用只统计已纳入批次（`batches`）的设备，未纳入批次的目标不占用。
 - `ineligibleDevices` 按 device-id 升序给出 `{deviceId, reason}`，每台设备唯一原因：
   版本不符为 `VERSION_MISMATCH`，被占用为 `DEVICE_BUSY`；两者兼有时
   `VERSION_MISMATCH` 优先。
