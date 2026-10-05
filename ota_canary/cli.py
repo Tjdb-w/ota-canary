@@ -875,6 +875,12 @@ def cmd_fleet_occupancy(state, args):
     }
 
 
+def batch_rollout_status_handler(state, args):
+    """fleet rollout-status 转发到批次子系统的只读跨子系统风险总览实现。"""
+    from . import batch_rollout
+    return batch_rollout.cmd_fleet_rollout_status(state, args)
+
+
 # ---------------------------------------------------------------------------
 # 命令行解析
 # ---------------------------------------------------------------------------
@@ -1012,6 +1018,15 @@ def build_parser():
                                  help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
     fleet_occupancy.set_defaults(handler=cmd_fleet_occupancy, mutating=False)
     add_state_option(fleet_occupancy)
+
+    fleet_rollout_status = fleet_sub.add_parser(
+        "rollout-status",
+        help="只读跨子系统风险总览（release 与 batch rollout 的活动发布）")
+    fleet_rollout_status.add_argument("--at", default=None,
+                                      help="观察时刻（ISO 8601）；缺省取调用时 UTC")
+    fleet_rollout_status.set_defaults(
+        handler=batch_rollout_status_handler, mutating=False)
+    add_state_option(fleet_rollout_status)
 
     # 批次灰度推进与自动故障回滚（增量子系统），独立于上面的 release 能力。
     from . import batch_rollout

@@ -57,6 +57,9 @@ python -m ota_canary fleet status \
 python -m ota_canary fleet occupancy \
     [--device-id d1 --device-id d2] \
     [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
+
+# 只读跨子系统风险总览（release 与 batch rollout 的活动发布）
+python -m ota_canary fleet rollout-status [--at 2026-10-01T10:00:00Z]
 ```
 
 行为约定：
@@ -170,6 +173,49 @@ python -m ota_canary fleet occupancy \
   冲突只标记不报错。`summary` 含 `totalDevices`、`selectedDevices`、
   `occupiedCount`、`conflictCount`、`freshCount`、`staleCount`、`unknownCount`。
   状态损坏返回 `InvalidState`；错误均走 stderr JSON、非零退出且不改状态文件。
+- `fleet rollout-status` 为只读跨子系统风险总览，读 `releases` 与
+  `batchRollouts`，不建批次、不补超时、不写状态文件，重复调用（同一 `--at`）
+  结果稳定：可选 `--at`，按既有 ISO 8601 规则换算 UTC（支持 `Z`，无偏移按
+  UTC），非法值返回 `InvalidArgument`；缺省取调用时 UTC 并以 `Z` 输出。沿用
+  `--state`（放在子命令前后均可），既有命令的请求/响应均不变。成功输出顶层
+  固定为 `at`、`summary`、`campaigns`。仅列活动发布：状态为 `in_progress`/
+  `paused` 的 release，与状态为 `in_progress`/`paused`/`failed_stopped` 的
+  batch rollout；`pending` 及各终态不列，无活动发布时 `campaigns` 为 `[]`。
+  `campaigns` 按 `kind`（`batch` 在 `release` 前）、`id` 升序；每项为 `kind`、
+  `id`、`status`、`versions`、`targetDeviceIds`、`progress`、`risk`、
+  `deadline`、`stopReason`：
+  - `versions` 为 `{target, rollback}`，口径同 `status`：release 取
+    `version`/`previousVersion`，batch 取 `targetVersion`/`stableVersion`。
+  - `targetDeviceIds` 口径同 `status`：release 未定向（含旧状态缺字段）为
+    `null`；batch 为创建时目标集合按 device-id 升序（旧状态缺字段按 `[]`）。
+  - `progress` 为 `{current, batchCount, reported, failed, rate}`：release 的
+    `current` 为从 0 起的 `currentBatch`（`pending` 等无批次时为 0，活动发布
+    下即当前批序号），batch 的 `current` 为其 `currentBatch`（从 0 起）；
+    `batchCount` 为批次数；`reported`、`failed` 同 `status` 口径（release 为
+    reports 总数与其中失败数，batch 为已取得升级终态数与其中失败数，均不含
+    回滚尝试）；`rate = failed / reported`，保留 6 位小数，`reported` 为 0 时
+    为 `null`。批次号、期限、`stopReason` 在状态中缺失或为 `null` 时输出
+    `null`；设备列表缺失或为空按空数组处理。
+  - `risk` 为 `{overdue, pending, failed}`，均为按 device-id 升序的设备数组；
+    顶层 `summary.risk` 为三者设备数之和。`overdue` 按各子系统 `status` 的
+    超时与暂停口径，只列观察时刻已逾期且尚未补写超时终态的设备：release 与
+    `release check` 同判据（当前批无报告设备，`at` 严格晚于
+    `heartbeatAt + heartbeat-timeout-seconds`；release 暂停不扣除墙钟时长），
+    batch 与 `batch status` 的 `waiting_heartbeat` 同判据（扣除已闭合暂停
+    时长；`paused`/`failed_stopped` 及终态不列逾期）。`pending`、`failed`
+    只用于 batch：列最新一条回滚任务（设备当前 `rollback` 记录）为
+    `pending`/`failure` 的设备；release 恒为 `[]`。被 `rollback-retry` 归档进
+    `rollbackAttempts` 的历史尝试不计入，不区分重试次数。
+  - `deadline` 取观察时刻尚未过去（截止时刻大于等于 `--at`）的
+    `stabilizationDeadline` 与 `rollbackDeadline` 中最早者，输出
+    `{type, at}`，`type` 为 `stabilization` 或 `rollback`，`at` 为 UTC `Z`；
+    两者均缺失、均已过去时为 `null`（release 无回滚截止时刻）。
+  - `stopReason` 取发布停止原因，缺失或为 `null` 时输出 `null`。
+  - `summary` 含 `campaignCount`、`statusCounts`（按状态名聚合的活动发布数，
+    键按字典序）、`risk`（`overdue`/`pending`/`failed` 设备数）。
+  状态损坏或语义不明（非字典状态、未知状态、批次/报告/回滚记录结构损坏、
+  时间戳非法等）返回 `InvalidState`；错误均走 stderr JSON、非零退出且不改
+  状态文件。
 - `release pause` 仅对 `in_progress` 发布生效：状态改为 `paused`，原样保留
   `batches`、`currentBatch`、`reports`、设备版本与心跳。`release resume` 仅对
   `paused` 发布生效：恢复为 `in_progress`，从同一批次继续，不重建批次或报告。

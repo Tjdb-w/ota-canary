@@ -1504,6 +1504,363 @@ def feed_public_heartbeat(state, device_id, version, heartbeat_text):
 
 
 # ---------------------------------------------------------------------------
+# 只读跨子系统风险总览（fleet rollout-status）
+# ---------------------------------------------------------------------------
+
+# 活动（需要风险跟踪）状态：与跨子系统占用口径一致——release 为
+# in_progress/paused；batch rollout 为 in_progress/paused/failed_stopped。
+ACTIVE_RELEASE_STATUSES = (STATUS_IN_PROGRESS, STATUS_PAUSED)
+ACTIVE_BATCH_STATUSES = (
+    STATUS_IN_PROGRESS, STATUS_PAUSED, STATUS_FAILED_STOPPED,
+)
+
+RELEASE_STATUS_SET = (
+    STATUS_PENDING, STATUS_IN_PROGRESS, STATUS_PAUSED,
+    STATUS_COMPLETED, STATUS_ROLLED_BACK,
+)
+BATCH_STATUS_SET = (
+    STATUS_PENDING, STATUS_IN_PROGRESS, STATUS_PAUSED, STATUS_COMPLETED,
+    STATUS_FAILED_STOPPED, STATUS_ROLLED_BACK, STATUS_ROLLBACK_FAILED,
+)
+ROLLBACK_STATE_SET = ("pending", "success", "failure")
+
+
+def _corrupted(ref, detail="is corrupted"):
+    raise cli.InvalidState("%s %s" % (ref, detail))
+
+
+def _optional_time(value, ref, label):
+    """可空时间戳：None/缺失 -> None；非法字符串语义不明 -> InvalidState。
+
+    合法值统一换算回 UTC ``Z`` 文本输出，保证总览查询输出稳定。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _corrupted(ref)
+    try:
+        return cli.format_instant(cli.parse_time(value))
+    except cli.InvalidArgument:
+        _corrupted(ref, "has invalid %s" % label)
+
+
+def _validate_device_table(devices):
+    if not isinstance(devices, dict):
+        _corrupted("state file")
+    for device_id, record in devices.items():
+        if not isinstance(device_id, str) or not isinstance(record, dict):
+            _corrupted("state file")
+        heartbeat_text = record.get("heartbeatAt")
+        if heartbeat_text is not None:
+            _optional_time(heartbeat_text, "device %s" % device_id, "heartbeatAt")
+
+
+def _release_overdue_device_ids(state, release, at_instant):
+    """release 超时口径下观察时刻已逾期且未补超时终态的当前批设备（升序）。
+
+    与 ``release check`` 同一判据：仅当前批、reports 中无任何结果（含此前 check
+    补写的 reason=timeout 终态）、设备 heartbeatAt 非空，且观察时刻严格晚于
+    heartbeatAt + heartbeatTimeoutSeconds。release 的暂停只冻结 check/report
+    写入口、不移动超时钟（无暂停时长扣除），故 in_progress/paused 均按同一墙钟
+    口径列示；只读不补写。
+    """
+    if release.get("status") not in ACTIVE_RELEASE_STATUSES:
+        return []
+    current = release["currentBatch"]
+    batches = release["batches"]
+    if not isinstance(current, int) or current < 0 or current >= len(batches):
+        return []
+    timeout = timedelta(seconds=release["heartbeatTimeoutSeconds"])
+    reports = release["reports"]
+    devices = state["devices"]
+    overdue = []
+    for device_id in batches[current]:
+        if device_id in reports:
+            continue
+        record = devices.get(device_id)
+        heartbeat_text = record.get("heartbeatAt") if isinstance(record, dict) else None
+        if heartbeat_text is None:
+            continue
+        if at_instant > cli.parse_time(heartbeat_text) + timeout:
+            overdue.append(device_id)
+    overdue.sort()
+    return overdue
+
+
+def _batch_overdue_device_ids(rollout, at_instant):
+    """batch 超时/暂停口径下的逾期设备：与 batch status 的 waiting_heartbeat 同口径。
+
+    仅 in_progress 批次（暂停/停止/终态不补超时），判据扣除已闭合暂停时长：
+    ``at - 暂停重叠 > 计时锚点 + heartbeatTimeoutSeconds``。
+    """
+    if rollout.get("status") != STATUS_IN_PROGRESS:
+        return []
+    overdue = [
+        device_id for device_id, entry in rollout["devices"].items()
+        if effective_phase(rollout, entry, at_instant) == PHASE_WAITING_HEARTBEAT
+    ]
+    overdue.sort()
+    return overdue
+
+
+def _batch_rollback_risk(rollout):
+    """最新一条回滚任务（entry.rollback）为 pending/failure 的设备（升序）。
+
+    被 rollback-retry 归档进 rollbackAttempts 的历史尝试不计入。
+    """
+    pending = []
+    failed = []
+    for device_id, entry in rollout["devices"].items():
+        record = entry.get("rollback")
+        if not isinstance(record, dict):
+            continue
+        state_name = record.get("state")
+        if state_name == "pending":
+            pending.append(device_id)
+        elif state_name == "failure":
+            failed.append(device_id)
+    return sorted(pending), sorted(failed)
+
+
+def _campaign_deadline(stabilization_text, rollback_text, at_instant):
+    """取观察时刻尚未过去（截止时刻 >= 观察时刻）的 stabilization/rollback 截止最早者。"""
+    candidates = []
+    if stabilization_text is not None:
+        candidates.append((cli.parse_time(stabilization_text), "stabilization"))
+    if rollback_text is not None:
+        candidates.append((cli.parse_time(rollback_text), "rollback"))
+    pending = [
+        (instant, kind) for instant, kind in candidates if instant >= at_instant
+    ]
+    if not pending:
+        return None
+    instant, kind = min(pending, key=lambda item: (item[0], item[1]))
+    return {"type": kind, "at": cli.format_instant(instant)}
+
+
+def _risk_rate(failed, reported):
+    """rate = failed / reported，保留 6 位小数；reported 为 0 时 null。"""
+    if reported == 0:
+        return None
+    return round(float(Fraction(failed, reported)), 6)
+
+
+def _release_campaign(state, release_id, release, at_instant):
+    ref = "release %s" % release_id
+    if not isinstance(release, dict):
+        _corrupted(ref)
+    status = release.get("status")
+    if status not in RELEASE_STATUS_SET:
+        _corrupted(ref, "has unknown status %r" % (status,))
+    target_version = release.get("version")
+    rollback_version = release.get("previousVersion")
+    if not isinstance(target_version, str) or not isinstance(rollback_version, str):
+        _corrupted(ref)
+    target_devices = release.get("targetDeviceIds")
+    if target_devices is not None:
+        if not isinstance(target_devices, list) \
+                or not all(isinstance(device_id, str) for device_id in target_devices):
+            _corrupted(ref)
+        target_devices = sorted(target_devices)
+    timeout_seconds = release.get(
+        "heartbeatTimeoutSeconds", cli.DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+    )
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) \
+            or timeout_seconds < 1:
+        _corrupted(ref)
+    reports = release.get("reports")
+    if not isinstance(reports, dict):
+        _corrupted(ref)
+    for device_id, report in reports.items():
+        if not isinstance(device_id, str) or not isinstance(report, dict):
+            _corrupted(ref)
+        _optional_time(report.get("heartbeatAt"), ref, "report heartbeatAt")
+    current = release.get("currentBatch")
+    if current is not None and (
+            not isinstance(current, int) or isinstance(current, bool) or current < 0):
+        _corrupted(ref)
+    batches = release.get("batches")
+    # 结构校验：batches 必须为字符串列表的列表（损坏 -> InvalidState）。
+    cli.occupancy_batch_indices(release, ref)
+    if status in ACTIVE_RELEASE_STATUSES:
+        # 活动发布必须有落在批次范围内的当前批，否则状态语义不明。
+        if current is None or not isinstance(batches, list) or current >= len(batches):
+            _corrupted(ref)
+
+    reported = len(reports)
+    failed = sum(
+        1 for report in reports.values() if report.get("result") == "failure"
+    )
+    overdue = _release_overdue_device_ids(state, release, at_instant)
+    stabilization = _optional_time(
+        release.get("stabilizationDeadline"), ref, "stabilizationDeadline"
+    )
+    stop_reason = release.get("stopReason")
+    if stop_reason is not None and not isinstance(stop_reason, str):
+        _corrupted(ref)
+    return {
+        "kind": "release",
+        "id": release_id,
+        "status": status,
+        "versions": {"target": target_version, "rollback": rollback_version},
+        "targetDeviceIds": target_devices,
+        "progress": {
+            "current": current,
+            "batchCount": len(batches),
+            "reported": reported,
+            "failed": failed,
+            "rate": _risk_rate(failed, reported),
+        },
+        # release 子系统没有回滚任务，pending/failed 恒为空设备数组。
+        "risk": {"overdue": overdue, "pending": [], "failed": []},
+        "deadline": _campaign_deadline(stabilization, None, at_instant),
+        "stopReason": stop_reason,
+    }
+
+
+def _batch_campaign(state, batch_id, rollout, at_instant):
+    ref = "batch %s" % batch_id
+    if not isinstance(rollout, dict):
+        _corrupted(ref)
+    status = rollout.get("status")
+    if status not in BATCH_STATUS_SET:
+        _corrupted(ref, "has unknown status %r" % (status,))
+    target_version = rollout.get("targetVersion")
+    rollback_version = rollout.get("stableVersion")
+    if not isinstance(target_version, str) or not isinstance(rollback_version, str):
+        _corrupted(ref)
+    target_devices = rollout.get("targetDeviceIds")
+    if target_devices is None:
+        target_devices = []
+    if not isinstance(target_devices, list) \
+            or not all(isinstance(device_id, str) for device_id in target_devices):
+        _corrupted(ref)
+    target_devices = sorted(target_devices)
+    timeout_seconds = rollout.get("heartbeatTimeoutSeconds")
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool) \
+            or timeout_seconds < 1:
+        _corrupted(ref)
+    current = rollout.get("currentBatch")
+    if current is not None and (
+            not isinstance(current, int) or isinstance(current, bool) or current < 0):
+        _corrupted(ref)
+    batches = rollout.get("batches")
+    cli.occupancy_batch_indices(rollout, ref)
+    _optional_time(rollout.get("currentBatchStartedAt"), ref, "currentBatchStartedAt")
+    entries = rollout.get("devices")
+    if not isinstance(entries, dict):
+        _corrupted(ref)
+    if status in ACTIVE_BATCH_STATUSES:
+        # 活动批次的当前批必须落在批次范围内（failed_stopped 可能已派发回滚但
+        # 批次结构仍完整），否则状态语义不明。
+        if not isinstance(batches, list) or current is None or current >= len(batches):
+            _corrupted(ref)
+    reported = failed = 0
+    for device_id, entry in entries.items():
+        if not isinstance(device_id, str) or not isinstance(entry, dict):
+            _corrupted(ref)
+        phase = entry.get("phase")
+        if not isinstance(phase, str):
+            _corrupted(ref)
+        batch_index = entry.get("batchIndex")
+        if not isinstance(batch_index, int) or isinstance(batch_index, bool) \
+                or batch_index < 0:
+            _corrupted(ref)
+        _optional_time(entry.get("lastHeartbeatAt"), ref, "lastHeartbeatAt")
+        terminal = entry.get("terminal")
+        if terminal is not None:
+            if not isinstance(terminal, dict) \
+                    or terminal.get("result") not in ("success", "failure"):
+                _corrupted(ref)
+            reported += 1
+            if terminal.get("result") == "failure":
+                failed += 1
+        record = entry.get("rollback")
+        if record is not None:
+            if not isinstance(record, dict) \
+                    or record.get("state") not in ROLLBACK_STATE_SET:
+                _corrupted(ref)
+    overdue = _batch_overdue_device_ids(rollout, at_instant)
+    pending, rollback_failed = _batch_rollback_risk(rollout)
+    stabilization = _optional_time(
+        rollout.get("stabilizationDeadline"), ref, "stabilizationDeadline"
+    )
+    rollback_deadline = _optional_time(
+        rollout.get("rollbackDeadline"), ref, "rollbackDeadline"
+    )
+    stop_reason = rollout.get("stopReason")
+    if stop_reason is not None and not isinstance(stop_reason, str):
+        _corrupted(ref)
+    return {
+        "kind": "batch",
+        "id": batch_id,
+        "status": status,
+        "versions": {"target": target_version, "rollback": rollback_version},
+        "targetDeviceIds": target_devices,
+        "progress": {
+            "current": current,
+            "batchCount": len(batches),
+            "reported": reported,
+            "failed": failed,
+            "rate": _risk_rate(failed, reported),
+        },
+        "risk": {"overdue": overdue, "pending": pending, "failed": rollback_failed},
+        "deadline": _campaign_deadline(stabilization, rollback_deadline, at_instant),
+        "stopReason": stop_reason,
+    }
+
+
+def cmd_fleet_rollout_status(state, args):
+    """只读跨子系统风险总览：不建批次、不补超时、不写状态，重复调用结果稳定。"""
+    if args.at is None:
+        at_instant = datetime.now(timezone.utc)
+    else:
+        _, at_instant = cli.require_time(args.at)
+
+    devices = state.get("devices")
+    releases = state.get("releases")
+    rollouts_map = state.get("batchRollouts", {})
+    if not isinstance(devices, dict) or not isinstance(releases, dict) \
+            or not isinstance(rollouts_map, dict):
+        _corrupted("state file")
+    _validate_device_table(devices)
+
+    campaigns = []
+    for release_id, release in releases.items():
+        if not isinstance(release_id, str):
+            _corrupted("state file")
+        item = _release_campaign(state, release_id, release, at_instant)
+        if item["status"] in ACTIVE_RELEASE_STATUSES:
+            campaigns.append(item)
+    for batch_id, rollout in rollouts_map.items():
+        if not isinstance(batch_id, str):
+            _corrupted("state file")
+        item = _batch_campaign(state, batch_id, rollout, at_instant)
+        if item["status"] in ACTIVE_BATCH_STATUSES:
+            campaigns.append(item)
+    campaigns.sort(key=lambda item: (item["kind"], item["id"]))
+
+    status_counts = {}
+    for item in campaigns:
+        status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+    status_counts = {key: status_counts[key] for key in sorted(status_counts)}
+    summary = {
+        "campaignCount": len(campaigns),
+        "statusCounts": status_counts,
+        "risk": {
+            "overdue": sum(len(item["risk"]["overdue"]) for item in campaigns),
+            "pending": sum(len(item["risk"]["pending"]) for item in campaigns),
+            "failed": sum(len(item["risk"]["failed"]) for item in campaigns),
+        },
+    }
+    return {
+        "at": cli.format_instant(at_instant),
+        "summary": summary,
+        "campaigns": campaigns,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 命令行注册（由 cli.build_parser 调用）
 # ---------------------------------------------------------------------------
 
