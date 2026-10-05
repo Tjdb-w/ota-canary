@@ -52,6 +52,11 @@ python -m ota_canary status --release-id R1
 # 只读查看设备心跳与版本状态（全部设备 / 仅某发布批次）
 python -m ota_canary fleet status \
     [--release-id R1] [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
+
+# 只读解释设备占用（全部设备 / 指定设备，可重复）
+python -m ota_canary fleet occupancy \
+    [--device-id d1 --device-id d2] [--at 2026-10-01T10:00:00Z] \
+    [--heartbeat-timeout-seconds 900]
 ```
 
 行为约定：
@@ -146,6 +151,28 @@ python -m ota_canary fleet status \
   `totalDevices`、`freshCount`、`staleCount`、`unknownCount`、`occupiedCount`。
   空状态返回零计数与空 `devices`；状态损坏返回 `InvalidState`。错误均走 stderr
   JSON、非零退出且不改状态；`status` 与 `release plan` 的既有输出保持不变。
+- `fleet occupancy` 为只读视图，解释设备被哪些活动发布占用：可选、可重复的
+  `--device-id`、`--at`、`--heartbeat-timeout-seconds`，沿用 `--state`（子命令
+  前后均可）。`--at` 按 ISO 8601 换算 UTC（支持 `Z`，无偏移按 UTC），缺省取调用时
+  UTC；`--heartbeat-timeout-seconds` 为大于等于 1 的整数，缺省 `900`。省略
+  `--device-id` 查全部设备（按 device-id 升序），指定时只查这些设备（同样升序）；
+  任一设备不存在返回 `DeviceNotFound`，`--device-id` 空值或重复、非法 `--at` 或
+  timeout 返回 `InvalidArgument`。成功输出顶层固定为 `at`、
+  `heartbeatTimeoutSeconds`、`summary`、`devices`。`devices` 每项含 `deviceId`、
+  `version`、`heartbeatAt`、`ageSeconds`、`heartbeatState`、`occupied`、`conflict`、
+  `occupancies`：心跳口径与 `fleet status` 一致（`ageSeconds` 为观察时刻减
+  `heartbeatAt` 向下取整秒，等于或晚于观察时刻为 `0`，缺失为 `null`；心跳严格
+  早于观察时刻减 timeout 为 `stale`，否则 `fresh`，缺失为 `unknown`）。
+  `occupancies` 只列活动占用：状态为 `in_progress`/`paused` 的 release，以及状态为
+  `in_progress`/`paused`/`failed_stopped` 的 batch rollout，其已纳入批次
+  （`batches`）的设备被占用；`pending`、`completed`、`rolled_back`、
+  `rollback_failed` 不占用。每项为 `kind`（`release`/`batch`）、`id`、`status`、
+  `batchIndex`（从 1 起的批次号），按 `kind`、`id` 升序。`occupied` 为占用列表非空，
+  `conflict` 为同一设备有多项占用；冲突只标记不报错。`summary` 含 `totalDevices`
+  （全部设备数，与是否指定 `--device-id` 无关）、`selectedDevices`、`occupiedCount`、
+  `conflictCount`、`freshCount`、`staleCount`、`unknownCount`（后六项只统计所选
+  设备）。查询只读稳定：不创建批次、不改任何状态或状态文件；空状态返回零计数与空
+  `devices`，状态损坏返回 `InvalidState`，错误均走 stderr JSON、非零退出且不改文件。
 - `release pause` 仅对 `in_progress` 发布生效：状态改为 `paused`，原样保留
   `batches`、`currentBatch`、`reports`、设备版本与心跳。`release resume` 仅对
   `paused` 发布生效：恢复为 `in_progress`，从同一批次继续，不重建批次或报告。
