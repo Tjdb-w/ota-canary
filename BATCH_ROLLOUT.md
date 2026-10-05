@@ -26,6 +26,12 @@ python -m ota_canary batch create \
 python -m ota_canary batch plan --batch-id B1 [--at 2026-10-01T08:00:00Z]
 python -m ota_canary batch start --batch-id B1 [--at 2026-10-01T08:00:00Z]
 
+# 放量前调整 pending 批次的灰度策略与设备集合（不建批次、保持 pending）
+python -m ota_canary batch update --batch-id B1 --at 2026-10-01T07:00:00Z \
+    --batch-size 3 --failure-threshold 0.25 \
+    --target-device-id d2 --target-device-id d3 --target-device-id d4 \
+    --canary-device-id d4        # 或 --clear-canary-device-ids 清空金丝雀
+
 # 设备回传心跳时间、当前固件版本与升级终态（result 可省，表示仅心跳）
 python -m ota_canary batch report --batch-id B1 --device-id d1 \
     --version 2.0.0 --heartbeat-at 2026-10-01T09:00:00Z --result success
@@ -81,6 +87,29 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 `batch create --rollback-timeout-seconds` 为可选参数，取大于等于 1 的整数，缺省
 `900`；非法值返回 `InvalidBatchPolicy` 且不写状态。该策略用于回滚收束时限（见下节）。
+
+## 放量前调整（batch update，仅 pending）
+
+`batch update --batch-id B1 --at <ISO 8601>` 在放量前调整灰度策略与设备集合，
+仅对 `pending` 批次生效；`targetVersion` 与 `stableVersion` 不可修改。
+
+- 可重复的 `--target-device-id`：传入任一即以去重后的完整集合**替换**原目标；
+  可重复的 `--canary-device-id`：传入任一即替换原金丝雀；
+  `--clear-canary-device-ids` 清空金丝雀。未传入时目标与金丝雀均保留原值。
+- 策略参数 `--batch-size`、`--failure-threshold`、`--heartbeat-timeout-seconds`、
+  `--stabilization-seconds`、`--rollback-timeout-seconds` 缺省保留原值，
+  提供时取值范围与 `batch create` 完全相同。
+- 目标替换后旧金丝雀不在新集合时，必须同时给出新金丝雀或
+  `--clear-canary-device-ids`。
+- 校验与异常（全部通过后才一次写入，失败不改状态文件）：批次不存在 →
+  `DeviceNotFound`；非 pending → `InvalidState`；设备参数空/重复、金丝雀与
+  清空选项同现、旧金丝雀脱离新目标、未提供任何修改项 → `InvalidArgument`；
+  未登记设备 → `DeviceNotFound`；空目标集合 → `EmptyDeviceSet`；金丝雀不属于
+  目标或数量超过有效 `batch-size`、策略取值非法 → `InvalidBatchPolicy`。
+- 成功后保持 `pending`，不建批次、不改设备或占用，按 `--at` 的 UTC `Z` 时刻
+  追加 `policy_updated` 审计事件，并输出与 `batch status` 同口径的视图；
+  后续 `batch plan` / `batch start` 即按新目标、资格、金丝雀优先与分批规则计算。
+- 非 pending 的后续状态保留全部既有语义；旧状态兼容显示且不补写历史。
 
 ## 金丝雀设备优先放量（--canary-device-id）
 
@@ -299,13 +328,13 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 ## 审计时间线（batch timeline，只读）
 
-`batch create`、`start`、`report`、`check`、`abort`、`rollback-report`、
+`batch create`、`update`、`start`、`report`、`check`、`abort`、`rollback-report`、
 `rollback-retry`、`pause`、`resume` 成功后向批次追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态
 均不追加，历史事件只增不改。
 事件字段：`sequence`（从 1 起严格递增）、`type`、`occurredAt`、`batchIndex`、
 `deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason`，未涉及的字段为 `null`。
 
-- `type` 取值：`created`、`started`、`batch_opened`、`upgrade_reported`、
+- `type` 取值：`created`、`policy_updated`、`started`、`batch_opened`、`upgrade_reported`、
   `timeout_recorded`、`batch_advanced`、`stopped`、`rollback_started`、
   `rollback_reported`、`rollback_timed_out`、`rollback_retry_started`、
   `aborted`、`paused`、`resumed`、`finished`。

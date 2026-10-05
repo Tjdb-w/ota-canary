@@ -42,7 +42,15 @@
   覆盖），rollbackTimedOutCount 累计各次尝试中的 timeout；重试结果仍走
   batch rollback-report，再次超时仍由 batch check 记 failure(reason=timeout)，
   当前记录全 success 收束为 rolled_back，否则 rollback_failed 并可再次重试。
-- 审计时间线：create/start/report/check/abort/rollback-report/pause/resume/
+- 放量前调整 ``batch update``：仅对 pending 批次生效，可替换目标设备集合
+  （去重后整体替换）、替换或清空金丝雀、调整 batch-size/failure-threshold/
+  heartbeat-timeout-seconds/stabilization-seconds/rollback-timeout-seconds；
+  targetVersion 与 stableVersion 不可改，未提供的策略项保留原值。目标替换后
+  旧金丝雀不在新集合时必须同时给出新金丝雀或 --clear-canary-device-ids。
+  全部校验通过后才一次写入，保持 pending、不建批次、不改设备或占用，按
+  --at 追加 policy_updated 审计事件；后续 batch plan/start 即按新集合与
+  策略计算资格、金丝雀优先与分批。
+- 审计时间线：create/update/start/report/check/abort/rollback-report/pause/resume/
   rollback-retry 成功后
   向批次追加严格递增事件（失败、幂等重复、冲突/迟到不追加，历史只增不改），
   ``batch timeline`` 只读查询，支持 --after-sequence 与 --limit 分页。
@@ -127,6 +135,7 @@ EVENT_RESUMED = "resumed"
 EVENT_FINISHED = "finished"
 EVENT_ROLLBACK_TIMED_OUT = "rollback_timed_out"
 EVENT_ROLLBACK_RETRY_STARTED = "rollback_retry_started"
+EVENT_POLICY_UPDATED = "policy_updated"
 
 # 回滚收束时限缺省秒数（旧状态缺 rollbackTimeoutSeconds 时按此解释）
 DEFAULT_ROLLBACK_TIMEOUT_SECONDS = 900
@@ -442,6 +451,149 @@ def cmd_batch_create(state, args):
     # 创建成功：追加 created 事件（无显式时刻，取调用时刻）。
     append_event(rollout, EVENT_CREATED, datetime.now(timezone.utc))
     return batch_view(state, rollout, at_instant=None)
+
+
+# ---------------------------------------------------------------------------
+# 放量前调整（仅 pending：替换目标/金丝雀集合与灰度策略，不建批次）
+# ---------------------------------------------------------------------------
+
+def require_update_canary_ids(values):
+    """batch update 的金丝雀参数语法校验：空值/重复 -> InvalidArgument；升序返回。
+
+    成员归属与数量上限按 update 口径单独判定（InvalidBatchPolicy），与
+    batch create 的 require_canary_device_ids 异常口径不同，故不复用。
+    """
+    seen = set()
+    ids = []
+    for value in values or []:
+        if not isinstance(value, str) or not value.strip():
+            raise cli.InvalidArgument("canary-device-id must be a non-empty string: %r" % (value,))
+        device_id = value.strip()
+        if device_id in seen:
+            raise cli.InvalidArgument("duplicate canary-device-id: %s" % device_id)
+        seen.add(device_id)
+        ids.append(device_id)
+    return sorted(ids)
+
+
+def cmd_batch_update(state, args):
+    """放量前调整 pending 批次的灰度策略与设备集合。
+
+    仅 pending 可更新；targetVersion/stableVersion 不变，未提供的策略项保留
+    原值。传入任一 --target-device-id 时以去重后的完整集合替换原目标，传入
+    任一 --canary-device-id 时替换原金丝雀，--clear-canary-device-ids 清空
+    金丝雀。全部校验通过后才一次写入：保持 pending、不建批次、不改设备或
+    占用，按 --at 追加 policy_updated 审计事件，返回 batch status 同口径视图。
+    """
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    _, at_instant = cli.require_time(args.at)
+    rollout = get_rollout(state, batch_id)
+    if rollout["status"] != STATUS_PENDING:
+        raise cli.InvalidState(
+            "batch %s cannot be updated (status: %s)" % (batch_id, rollout["status"])
+        )
+
+    target_values = getattr(args, "target_device_id", None)
+    canary_values = getattr(args, "canary_device_id", None)
+    clear_canary = bool(getattr(args, "clear_canary_device_ids", False))
+
+    # 设备参数语法校验：空值/重复 InvalidArgument；显式空目标集合 EmptyDeviceSet。
+    new_targets = None
+    if target_values is not None:
+        new_targets = require_batch_device_ids(target_values)
+    new_canary = None
+    if canary_values is not None:
+        new_canary = require_update_canary_ids(canary_values)
+    if new_canary is not None and clear_canary:
+        raise cli.InvalidArgument(
+            "canary-device-id and clear-canary-device-ids cannot be used together"
+        )
+
+    # 未提供任何修改项（目标/金丝雀/清空/策略）时拒绝。
+    policy_given = any((
+        args.batch_size is not None,
+        args.failure_threshold is not None,
+        args.heartbeat_timeout_seconds is not None,
+        args.stabilization_seconds is not None,
+        args.rollback_timeout_seconds is not None,
+    ))
+    if new_targets is None and new_canary is None and not clear_canary \
+            and not policy_given:
+        raise cli.InvalidArgument("batch update requires at least one change")
+
+    # 策略参数：未提供保留原值；提供时沿用 batch create 的取值范围，
+    # 非法取值 InvalidBatchPolicy。
+    if args.batch_size is None:
+        batch_size = rollout["batchSize"]
+    else:
+        batch_size = require_policy_batch_size(args.batch_size)
+    if args.failure_threshold is None:
+        failure_threshold = rollout["failureThreshold"]
+    else:
+        _, threshold = require_failure_threshold(args.failure_threshold)
+        failure_threshold = str(threshold)
+    if args.heartbeat_timeout_seconds is None:
+        heartbeat_timeout = rollout["heartbeatTimeoutSeconds"]
+    else:
+        heartbeat_timeout = require_policy_timeout(args.heartbeat_timeout_seconds)
+    if args.stabilization_seconds is None:
+        stabilization_seconds = rollout.get("stabilizationSeconds", 0)
+    else:
+        stabilization_seconds = require_policy_stabilization(args.stabilization_seconds)
+    if args.rollback_timeout_seconds is None:
+        rollback_timeout = rollout.get(
+            "rollbackTimeoutSeconds", DEFAULT_ROLLBACK_TIMEOUT_SECONDS
+        )
+    else:
+        rollback_timeout = require_rollback_timeout(args.rollback_timeout_seconds)
+
+    # 目标替换：去重后的完整集合整体替换；每台设备必须已登记（DeviceNotFound）。
+    if new_targets is None:
+        new_targets = list(rollout["targetDeviceIds"])
+    else:
+        for device_id in new_targets:
+            cli.get_device(state, device_id)
+
+    # 金丝雀解析：显式替换 > 清空 > 保留旧值。目标替换后旧金丝雀不在新集合
+    # 且未给出新金丝雀或清空选项时拒绝（InvalidArgument）。
+    if clear_canary:
+        effective_canary = []
+    elif new_canary is not None:
+        effective_canary = new_canary
+    else:
+        effective_canary = sorted(rollout.get("canaryDeviceIds") or [])
+        if target_values is not None \
+                and any(device_id not in set(new_targets) for device_id in effective_canary):
+            raise cli.InvalidArgument(
+                "existing canary devices are no longer in the target set; "
+                "provide --canary-device-id or --clear-canary-device-ids"
+            )
+    # 金丝雀越界：须属于（更新后的）目标集合且数量不超过有效 batch-size。
+    target_set = set(new_targets)
+    for device_id in effective_canary:
+        if device_id not in target_set:
+            raise InvalidBatchPolicy(
+                "canary-device-id must be one of the target-device-id values: %s"
+                % device_id
+            )
+    if len(effective_canary) > batch_size:
+        raise InvalidBatchPolicy(
+            "canary device count %d exceeds batch-size %d"
+            % (len(effective_canary), batch_size)
+        )
+
+    # 全部校验通过，一次写入：保持 pending，不建批次、不改设备或占用。
+    if target_values is not None:
+        rollout["targetDeviceIds"] = new_targets
+    if clear_canary or new_canary is not None:
+        rollout["canaryDeviceIds"] = effective_canary
+    rollout["batchSize"] = batch_size
+    rollout["failureThreshold"] = failure_threshold
+    rollout["heartbeatTimeoutSeconds"] = heartbeat_timeout
+    rollout["stabilizationSeconds"] = stabilization_seconds
+    rollout["rollbackTimeoutSeconds"] = rollback_timeout
+    append_event(rollout, EVENT_POLICY_UPDATED, at_instant)
+    return batch_view(state, rollout, at_instant=at_instant)
 
 
 # ---------------------------------------------------------------------------
@@ -1904,6 +2056,34 @@ def register_parsers(subparsers, add_state_option):
                                    "不重复且数量不超过 batch-size，按 device-id 升序进入第一批")
     batch_create.set_defaults(handler=cmd_batch_create, mutating=True)
     add_state_option(batch_create)
+
+    batch_update = batch_sub.add_parser(
+        "update", help="放量前调整 pending 批次的灰度策略与设备集合（不建批次）")
+    batch_update.add_argument("--batch-id", required=True)
+    batch_update.add_argument("--at", required=True, help="更新时刻（ISO 8601）")
+    batch_update.add_argument("--target-device-id", action="append",
+                              default=argparse.SUPPRESS,
+                              help="目标设备，可重复；传入任一即以去重后的完整集合"
+                                   "替换原目标，集合必须非空且设备已登记")
+    batch_update.add_argument("--canary-device-id", action="append",
+                              default=argparse.SUPPRESS,
+                              help="金丝雀设备，可重复；传入任一即替换原金丝雀，"
+                                   "须属于更新后的目标集合且数量不超过 batch-size")
+    batch_update.add_argument("--clear-canary-device-ids", action="store_true",
+                              default=False,
+                              help="清空金丝雀设备；不能与 --canary-device-id 同用")
+    batch_update.add_argument("--batch-size", default=None,
+                              help="每批数量，正整数；缺省保留原值")
+    batch_update.add_argument("--failure-threshold", default=None,
+                              help="失败率阈值，严格大于 0 且小于 1 的小数；缺省保留原值")
+    batch_update.add_argument("--heartbeat-timeout-seconds", default=None,
+                              help="心跳超时时长（秒），大于 0 的整数；缺省保留原值")
+    batch_update.add_argument("--stabilization-seconds", default=None,
+                              help="稳定观察秒数，大于等于 0 的整数；缺省保留原值")
+    batch_update.add_argument("--rollback-timeout-seconds", default=None,
+                              help="回滚收束时限（秒），大于等于 1 的整数；缺省保留原值")
+    batch_update.set_defaults(handler=cmd_batch_update, mutating=True)
+    add_state_option(batch_update)
 
     batch_plan = batch_sub.add_parser("plan", help="只读预检 pending 发布的启动资格与分批计划")
     batch_plan.add_argument("--batch-id", required=True)
