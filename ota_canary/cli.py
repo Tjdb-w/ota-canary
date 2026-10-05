@@ -876,6 +876,299 @@ def cmd_fleet_occupancy(state, args):
 
 
 # ---------------------------------------------------------------------------
+# 跨子系统风险总览（fleet rollout-status，只读）
+# ---------------------------------------------------------------------------
+
+def rollout_status_batches(entry, ref):
+    """只读校验并返回 batches（缺失按 []）；结构损坏返回 InvalidState。"""
+    batches = entry.get("batches")
+    if batches is None:
+        return []
+    if not isinstance(batches, list):
+        raise InvalidState("%s is corrupted" % ref)
+    for batch in batches:
+        if not isinstance(batch, list):
+            raise InvalidState("%s is corrupted" % ref)
+        for device_id in batch:
+            if not isinstance(device_id, str):
+                raise InvalidState("%s is corrupted" % ref)
+    return batches
+
+
+def rollout_status_time(text, ref, field):
+    """只读解析状态内时间戳；无法解析按状态损坏返回 InvalidState。"""
+    try:
+        return parse_time(text)
+    except InvalidArgument:
+        raise InvalidState("%s has invalid %s: %r" % (ref, field, text))
+
+
+def rollout_status_current(entry, ref):
+    """批次号：缺失为 None；存在但非整数按状态损坏处理。"""
+    current = entry.get("currentBatch")
+    if current is not None and (not isinstance(current, int) or isinstance(current, bool)):
+        raise InvalidState("%s is corrupted" % ref)
+    return current
+
+
+def rollout_status_target_ids(entry, ref, missing):
+    """目标设备列表：缺失按 missing（release 为 None、batch 为 []）；升序返回。"""
+    target_ids = entry.get("targetDeviceIds")
+    if target_ids is None:
+        return missing
+    if not isinstance(target_ids, list) \
+            or any(not isinstance(device_id, str) for device_id in target_ids):
+        raise InvalidState("%s is corrupted" % ref)
+    return sorted(target_ids)
+
+
+def rollout_status_deadline(entry, ref, at_instant):
+    """未过去的 stabilizationDeadline/rollbackDeadline 最早者；均无返回 None。"""
+    candidates = []
+    for field, kind in (("stabilizationDeadline", "stabilization"),
+                        ("rollbackDeadline", "rollback")):
+        text = entry.get(field)
+        if text is None:
+            continue
+        instant = rollout_status_time(text, ref, field)
+        if instant >= at_instant:
+            candidates.append((instant, kind))
+    if not candidates:
+        return None
+    instant, kind = min(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+    return {"type": kind, "at": format_instant(instant)}
+
+
+def rollout_status_rate(failed, reported):
+    """失败率：reported 为 0 时返回 None，否则 failed/reported（与 batch 视图同精度）。"""
+    if reported == 0:
+        return None
+    return round(failed / reported, 6)
+
+
+def release_campaign_view(devices, release_id, release, at_instant):
+    """只读构造 release 的风险总览项；状态损坏或语义不明返回 InvalidState。"""
+    ref = "release %s" % release_id
+    if not isinstance(release, dict):
+        raise InvalidState("%s is corrupted" % ref)
+    status = release.get("status")
+    if not isinstance(status, str):
+        raise InvalidState("%s is corrupted" % ref)
+    batches = rollout_status_batches(release, ref)
+    current = rollout_status_current(release, ref)
+    reports = release.get("reports")
+    if reports is None:
+        reports = {}
+    if not isinstance(reports, dict):
+        raise InvalidState("%s is corrupted" % ref)
+    reported = 0
+    failed = 0
+    for report in reports.values():
+        if not isinstance(report, dict):
+            raise InvalidState("%s is corrupted" % ref)
+        reported += 1
+        if report.get("result") == "failure":
+            failed += 1
+
+    # 超时风险与 release check 同一口径：仅 in_progress 判定（paused 冻结、
+    # 其余状态无超时口径）；当前批未报告设备心跳严格早于 at - 超时即逾期，
+    # 设备缺失或无心跳无法判定，不计入。
+    overdue = []
+    if status == "in_progress":
+        if current is None or current < 0 or current >= len(batches):
+            raise InvalidState("%s is corrupted" % ref)
+        timeout = release.get("heartbeatTimeoutSeconds", DEFAULT_HEARTBEAT_TIMEOUT_SECONDS)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+            raise InvalidState("%s is corrupted" % ref)
+        delta = timedelta(seconds=timeout)
+        for device_id in batches[current]:
+            if device_id in reports:
+                continue
+            device = devices.get(device_id)
+            if device is None:
+                continue
+            if not isinstance(device, dict):
+                raise InvalidState("device record is corrupted: %s" % device_id)
+            heartbeat_text = device.get("heartbeatAt")
+            if heartbeat_text is None:
+                continue
+            heartbeat_instant = rollout_status_time(
+                heartbeat_text, "device %s" % device_id, "heartbeatAt")
+            if at_instant > heartbeat_instant + delta:
+                overdue.append(device_id)
+
+    return {
+        "kind": "release",
+        "id": release_id,
+        "status": status,
+        "versions": {
+            "target": release.get("version"),
+            "rollback": release.get("previousVersion"),
+        },
+        # 同 status 口径：未定向或旧状态缺字段时为 null
+        "targetDeviceIds": rollout_status_target_ids(release, ref, None),
+        "progress": {
+            "current": current,
+            "batchCount": len(batches),
+            "reported": reported,
+            "failed": failed,
+            "rate": rollout_status_rate(failed, reported),
+        },
+        # release 子系统没有回滚任务，pending/failed 恒为空
+        "risk": {"overdue": sorted(overdue), "pending": [], "failed": []},
+        "deadline": rollout_status_deadline(release, ref, at_instant),
+        "stopReason": release.get("stopReason"),
+    }
+
+
+def batch_campaign_view(batch_id, rollout, at_instant):
+    """只读构造 batch rollout 的风险总览项；状态损坏或语义不明返回 InvalidState。"""
+    from . import batch_rollout  # 暂停区间扣除沿用批次子系统口径
+    ref = "batch %s" % batch_id
+    if not isinstance(rollout, dict):
+        raise InvalidState("%s is corrupted" % ref)
+    status = rollout.get("status")
+    if not isinstance(status, str):
+        raise InvalidState("%s is corrupted" % ref)
+    batches = rollout_status_batches(rollout, ref)
+    current = rollout_status_current(rollout, ref)
+    entries = rollout.get("devices")
+    if entries is None:
+        entries = {}
+    if not isinstance(entries, dict):
+        raise InvalidState("%s is corrupted" % ref)
+    reported = 0
+    failed = 0
+    rollback_pending = []
+    rollback_failed = []
+    for device_id, entry in entries.items():
+        if not isinstance(device_id, str) or not isinstance(entry, dict):
+            raise InvalidState("%s is corrupted" % ref)
+        terminal = entry.get("terminal")
+        if terminal is not None:
+            if not isinstance(terminal, dict):
+                raise InvalidState("%s is corrupted" % ref)
+            reported += 1
+            if terminal.get("result") == "failure":
+                failed += 1
+        rollback = entry.get("rollback")
+        if rollback is None:
+            continue
+        if not isinstance(rollback, dict):
+            raise InvalidState("%s is corrupted" % ref)
+        # 只看最新回滚任务；被重试取代的归档尝试（rollbackAttempts）不计入。
+        rollback_state = rollback.get("state")
+        if rollback_state == "pending":
+            rollback_pending.append(device_id)
+        elif rollback_state == "failure":
+            rollback_failed.append(device_id)
+        elif rollback_state != "success":
+            raise InvalidState("%s is corrupted" % ref)
+
+    overdue = []
+    if status == "in_progress":
+        # 与 batch status 的 waiting_heartbeat 同一口径：当前批无终态设备，
+        # 有效流逝（扣除已闭合暂停）严格超过心跳超时即逾期；paused 冻结不判定。
+        if current is None or current < 0 or current >= len(batches):
+            raise InvalidState("%s is corrupted" % ref)
+        timeout = rollout.get("heartbeatTimeoutSeconds")
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+            raise InvalidState("%s is corrupted" % ref)
+        delta = timedelta(seconds=timeout)
+        for device_id in batches[current]:
+            entry = entries.get(device_id)
+            if entry is None:
+                raise InvalidState("%s is corrupted" % ref)
+            if entry.get("terminal") is not None:
+                continue
+            anchor_text = entry.get("lastHeartbeatAt") or rollout.get("currentBatchStartedAt")
+            if not anchor_text:
+                continue
+            anchor = rollout_status_time(anchor_text, ref, "heartbeat anchor")
+            paused_elapsed = batch_rollout.paused_duration_between(
+                rollout, anchor, at_instant)
+            if at_instant - paused_elapsed > anchor + delta:
+                overdue.append(device_id)
+    elif status == "failed_stopped":
+        # 回滚收束时限：at 严格晚于 rollbackDeadline 时，pending 回滚任务
+        # 逾期且尚未被 check 补写超时终态。
+        deadline_text = rollout.get("rollbackDeadline")
+        if deadline_text is not None:
+            deadline = rollout_status_time(deadline_text, ref, "rollbackDeadline")
+            if at_instant > deadline:
+                overdue = list(rollback_pending)
+
+    return {
+        "kind": "batch",
+        "id": batch_id,
+        "status": status,
+        "versions": {
+            "target": rollout.get("targetVersion"),
+            "rollback": rollout.get("stableVersion"),
+        },
+        # 同 status 口径：按 device-id 升序列出目标设备，缺字段时为 []
+        "targetDeviceIds": rollout_status_target_ids(rollout, ref, []),
+        "progress": {
+            "current": current,
+            "batchCount": len(batches),
+            "reported": reported,
+            "failed": failed,
+            "rate": rollout_status_rate(failed, reported),
+        },
+        "risk": {
+            "overdue": sorted(overdue),
+            "pending": sorted(rollback_pending),
+            "failed": sorted(rollback_failed),
+        },
+        "deadline": rollout_status_deadline(rollout, ref, at_instant),
+        "stopReason": rollout.get("stopReason"),
+    }
+
+
+def cmd_fleet_rollout_status(state, args):
+    """只读跨子系统风险总览：不推进、不补超时、不改状态，重复调用结果稳定。"""
+    if args.at is None:
+        at_instant = datetime.now(timezone.utc)
+    else:
+        _, at_instant = require_time(args.at)
+
+    devices = state.get("devices")
+    releases = state.get("releases")
+    rollouts = state.get("batchRollouts")
+    if rollouts is None:
+        rollouts = {}
+    if not isinstance(devices, dict) or not isinstance(releases, dict) \
+            or not isinstance(rollouts, dict):
+        raise InvalidState("state file is corrupted")
+
+    campaigns = []
+    for release_id, release in releases.items():
+        campaigns.append(release_campaign_view(devices, release_id, release, at_instant))
+    for batch_id, rollout in rollouts.items():
+        campaigns.append(batch_campaign_view(batch_id, rollout, at_instant))
+    campaigns.sort(key=lambda campaign: (campaign["kind"], campaign["id"]))
+
+    status_counts = {}
+    for campaign in campaigns:
+        status = campaign["status"]
+        status_counts[status] = status_counts.get(status, 0) + 1
+    summary = {
+        "campaignCount": len(campaigns),
+        "statusCounts": {key: status_counts[key] for key in sorted(status_counts)},
+        "risk": {
+            "overdue": sum(len(campaign["risk"]["overdue"]) for campaign in campaigns),
+            "pending": sum(len(campaign["risk"]["pending"]) for campaign in campaigns),
+            "failed": sum(len(campaign["risk"]["failed"]) for campaign in campaigns),
+        },
+    }
+    return {
+        "at": format_instant(at_instant),
+        "summary": summary,
+        "campaigns": campaigns,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 命令行解析
 # ---------------------------------------------------------------------------
 
@@ -1012,6 +1305,13 @@ def build_parser():
                                  help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
     fleet_occupancy.set_defaults(handler=cmd_fleet_occupancy, mutating=False)
     add_state_option(fleet_occupancy)
+
+    fleet_rollout_status = fleet_sub.add_parser(
+        "rollout-status", help="只读跨子系统风险总览（release 与 batch rollout 统一口径）")
+    fleet_rollout_status.add_argument("--at", default=None,
+                                      help="观察时刻（ISO 8601）；缺省取调用时 UTC")
+    fleet_rollout_status.set_defaults(handler=cmd_fleet_rollout_status, mutating=False)
+    add_state_option(fleet_rollout_status)
 
     # 批次灰度推进与自动故障回滚（增量子系统），独立于上面的 release 能力。
     from . import batch_rollout

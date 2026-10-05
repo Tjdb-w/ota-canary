@@ -57,6 +57,9 @@ python -m ota_canary fleet status \
 python -m ota_canary fleet occupancy \
     [--device-id d1 --device-id d2] \
     [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
+
+# 只读跨子系统风险总览（release 与 batch rollout 统一口径）
+python -m ota_canary fleet rollout-status [--at 2026-10-01T10:00:00Z]
 ```
 
 行为约定：
@@ -170,6 +173,29 @@ python -m ota_canary fleet occupancy \
   冲突只标记不报错。`summary` 含 `totalDevices`、`selectedDevices`、
   `occupiedCount`、`conflictCount`、`freshCount`、`staleCount`、`unknownCount`。
   状态损坏返回 `InvalidState`；错误均走 stderr JSON、非零退出且不改状态文件。
+- `fleet rollout-status` 为只读跨子系统风险总览，不推进、不补超时、不改状态文件，
+  重复调用结果稳定：可选 `--at`（ISO 8601，缺省取调用时 UTC 并以 `Z` 输出），
+  非法 `--at` 返回 `InvalidArgument`。成功输出顶层固定为 `at`、`summary`、
+  `campaigns`：读取 `releases` 与 `batchRollouts`，`campaigns` 按 kind、id 升序，
+  每项为 `kind`（`release`/`batch`）、`id`、`status`、`versions{target,rollback}`
+  （release 为 version/previousVersion，batch 为 targetVersion/stableVersion）、
+  `targetDeviceIds`（同 `status` 口径：release 未定向或旧状态缺字段为 `null`，
+  batch 按 device-id 升序、缺字段为 `[]`）、`progress{current,batchCount,reported,
+  failed,rate}`（`reported`/`failed` 同各 `status` 视图口径，`rate=failed/reported`，
+  `reported=0` 时为 `null`；批次号缺失为 `null`）、`risk{overdue,pending,failed}`
+  （设备 id 升序数组）、`deadline{type,at}`、`stopReason`（缺失为 `null`）。
+  `risk.overdue` 按各状态的超时/暂停口径列出观察时刻逾期且尚未补写超时终态的
+  设备：in_progress 的 release 为当前批未报告且心跳超时的设备（同 `release check`
+  口径），in_progress 的 batch 为当前批无终态且扣除暂停后心跳超时的设备（同
+  `batch status` 的 `waiting_heartbeat` 口径），failed_stopped 的 batch 为观察
+  时刻严格晚于 `rollbackDeadline` 时仍为 pending 的回滚任务设备；paused 冻结
+  不判逾期。`risk.pending`/`risk.failed` 列出最新回滚任务为 pending/failure 的
+  设备（只看当前回滚记录，被重试取代的归档尝试不计入）。`deadline` 取未过去的
+  `stabilizationDeadline` 与 `rollbackDeadline` 中最早者（`type` 为
+  `stabilization`/`rollback`，`at` 为 UTC `Z` 时刻），均无为 `null`。`summary`
+  含 `campaignCount`、`statusCounts`（按状态计数）与 `risk{overdue,pending,failed}`
+  （各风险数组的设备数合计）。无发布与批次时 `campaigns=[]`；状态损坏或语义不明
+  返回 `InvalidState`；错误均走 stderr JSON、非零退出且不改状态文件。
 - `release pause` 仅对 `in_progress` 发布生效：状态改为 `paused`，原样保留
   `batches`、`currentBatch`、`reports`、设备版本与心跳。`release resume` 仅对
   `paused` 发布生效：恢复为 `in_progress`，从同一批次继续，不重建批次或报告。
