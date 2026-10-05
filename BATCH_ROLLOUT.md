@@ -21,6 +21,15 @@ python -m ota_canary batch create \
     --stabilization-seconds 300 \
     --target-device-id d1 --target-device-id d2 --target-device-id d3
 
+# 放量前（仅 pending）调整灰度策略与设备集合；target/stable 版本保持不变
+python -m ota_canary batch update --batch-id B1 --at 2026-10-01T07:30:00Z \
+    --batch-size 3 --failure-threshold 0.4 --heartbeat-timeout-seconds 1200 \
+    --stabilization-seconds 600 --rollback-timeout-seconds 1200 \
+    --target-device-id d1 --target-device-id d2 --target-device-id d4 \
+    --canary-device-id d1
+python -m ota_canary batch update --batch-id B1 --at 2026-10-01T07:45:00Z \
+    --clear-canary-device-ids
+
 # 开始放量：仅把第一批设备置为 pending_upgrade
 # 启动前可先做只读资格预检（不改变任何状态）
 python -m ota_canary batch plan --batch-id B1 [--at 2026-10-01T08:00:00Z]
@@ -97,6 +106,46 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   `batch status` 顶层增加 `canaryDeviceIds`，`devices` 每项增加 `canary`
   （仅标记金丝雀身份，不改变 phase、terminal、rollback、failureRate、占用与
   错误语义）。旧状态缺少该字段时显示 `[]` 与 `false`，只读不补写。
+
+## 放量前调整（batch update，仅 pending）
+
+```bash
+python -m ota_canary batch update --batch-id B1 --at <ISO 8601>
+    [--batch-size N] [--failure-threshold X] [--heartbeat-timeout-seconds N]
+    [--stabilization-seconds N] [--rollback-timeout-seconds N]
+    [--target-device-id d1 [--target-device-id d2 ...]]
+    [--canary-device-id d1 [--canary-device-id d2 ...] | --clear-canary-device-ids]
+```
+
+- 仅 `pending` 批次可用，用于放量前调整灰度策略与设备集合；`targetVersion` 与
+  `stableVersion` 保持不变，未提供的策略项保留原值。`--at` 为必填的事件时刻
+  （ISO 8601，换算为 UTC `Z`），本身不构成修改项。
+- **策略**：`--batch-size`（正整数）、`--failure-threshold`（严格 `0 < x < 1`）、
+  `--heartbeat-timeout-seconds`（`>=1`）、`--stabilization-seconds`（`>=0`）、
+  `--rollback-timeout-seconds`（`>=1`）取值范围与 `batch create` 完全一致，
+  非法值返回 `InvalidBatchPolicy`。
+- **目标集合替换**：传入任一 `--target-device-id` 时，以去重后的**完整集合**替换
+  原目标（不做并集）；目标须非空且设备均已登记。未提供则保留原目标。
+- **金丝雀替换/清空**：传入任一 `--canary-device-id` 时以该完整集合替换原金丝雀；
+  `--clear-canary-device-ids` 清空金丝雀；两者同时出现返回 `InvalidArgument`。
+  金丝雀（含未显式传入时保留的原金丝雀）必须属于更新后的目标集合，且数量不超过
+  更新后的 `batch-size`。
+- **旧金丝雀随目标失效**：目标被替换后旧金丝雀不在新集合中，又未提供新金丝雀或
+  清空选项时返回 `InvalidArgument`；保留的旧金丝雀数量超过新 `batch-size` 时返回
+  `InvalidBatchPolicy`。
+- 至少提供一个修改项（设备集合、金丝雀替换/清空或任一策略项），否则返回
+  `InvalidArgument`。
+- 校验全部通过后才**一次写入**：成功后保持 `pending`，不建 `batches`、不改设备
+  版本/心跳、不改变占用关系，只在 `--at` 的 UTC `Z` 时刻追加一条
+  `type=policy_updated` 的时间线事件（其余字段为 `null`），并输出与
+  `batch status` 同口径的视图。失败不追加事件、不修改状态文件。
+- 更新后的 batch plan 与 batch start 使用同一套**新目标、新资格、新金丝雀优先与
+  新分批规则**（`batchSize`/`canaryDeviceIds` 均取更新值）。
+- 错误（唯一异常码）：批次不存在 `DeviceNotFound`；非 `pending` `InvalidState`；
+  重复或空设备参数、金丝雀与清空选项同现、旧金丝雀脱离新目标、未提供修改项
+  `InvalidArgument`；未登记设备 `DeviceNotFound`；空目标 `EmptyDeviceSet`；
+  金丝雀越界或策略取值非法 `InvalidBatchPolicy`。非 `pending` 后续状态保留全部
+  既有语义；旧状态兼容显示，本次更新不补写任何历史。
 
 ## 回滚收束时限（rollback-timeout-seconds）
 
@@ -299,7 +348,7 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 ## 审计时间线（batch timeline，只读）
 
-`batch create`、`start`、`report`、`check`、`abort`、`rollback-report`、
+`batch create`、`start`、`update`、`report`、`check`、`abort`、`rollback-report`、
 `rollback-retry`、`pause`、`resume` 成功后向批次追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态
 均不追加，历史事件只增不改。
 事件字段：`sequence`（从 1 起严格递增）、`type`、`occurredAt`、`batchIndex`、
@@ -308,7 +357,10 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 - `type` 取值：`created`、`started`、`batch_opened`、`upgrade_reported`、
   `timeout_recorded`、`batch_advanced`、`stopped`、`rollback_started`、
   `rollback_reported`、`rollback_timed_out`、`rollback_retry_started`、
+  `policy_updated`、
   `aborted`、`paused`、`resumed`、`finished`。
+- `batch update` 成功时追加 `policy_updated` 事件，`occurredAt` 取 `--at`
+  换算的 UTC `Z` 时刻，其余字段为 `null`；更新失败不追加。
 - `occurredAt` 取显式 `--at`、调用时刻或心跳时刻，统一为 ISO 8601 UTC `Z` 后缀。
 - `batch check` 越过观察期截止时刻推进下一批时追加 `batch_advanced`，末批完成时
   追加 `finished`，`occurredAt` 取该次 `--at`；观察期内未越过截止时刻、且未补出
