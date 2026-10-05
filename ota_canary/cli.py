@@ -202,6 +202,22 @@ def require_target_device_ids(values):
     return sorted(target_ids)
 
 
+def require_occupancy_device_ids(values):
+    """校验可重复的 --device-id：未提供返回 None；空值或重复返回 InvalidArgument。"""
+    if values is None:
+        return None
+    seen = set()
+    device_ids = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidArgument("device-id must be a non-empty string: %r" % (value,))
+        if value in seen:
+            raise InvalidArgument("duplicate device-id: %s" % value)
+        seen.add(value)
+        device_ids.append(value)
+    return sorted(device_ids)
+
+
 def require_result(value):
     if value not in VALID_RESULTS:
         raise InvalidArgument("result must be one of %s: %r" % ("/".join(VALID_RESULTS), value))
@@ -743,6 +759,122 @@ def cmd_fleet_status(state, args):
     }
 
 
+def occupancy_batch_indices(entry, ref):
+    """只读计算发布/批次已纳入批次设备的 1 起批次号；结构损坏返回 InvalidState。
+
+    返回 {device_id: batch_index}，batch_index 从 1 起；同一设备出现在多个批次时
+    取最前的批次号（正常状态不会发生，只读不报错）。
+    """
+    batches = entry.get("batches")
+    if not isinstance(batches, list):
+        raise InvalidState("%s is corrupted" % ref)
+    indices = {}
+    for offset, batch in enumerate(batches):
+        if not isinstance(batch, list):
+            raise InvalidState("%s is corrupted" % ref)
+        for device_id in batch:
+            if not isinstance(device_id, str):
+                raise InvalidState("%s is corrupted" % ref)
+            indices.setdefault(device_id, offset + 1)
+    return indices
+
+
+def cmd_fleet_occupancy(state, args):
+    """只读解释设备占用：不建批次、不改状态，重复调用结果稳定。"""
+    if args.at is None:
+        at_instant = datetime.now(timezone.utc)
+    else:
+        _, at_instant = require_time(args.at)
+    timeout_seconds = require_heartbeat_timeout_seconds(args.heartbeat_timeout_seconds)
+    selected_ids = require_occupancy_device_ids(args.device_id)
+
+    devices = state.get("devices")
+    releases = state.get("releases")
+    rollouts = state.get("batchRollouts", {})
+    if not isinstance(devices, dict) or not isinstance(releases, dict) \
+            or not isinstance(rollouts, dict):
+        raise InvalidState("state file is corrupted")
+
+    # 收集活动占用：in_progress/paused 的 release 与 in_progress/paused/
+    # failed_stopped 的 batch rollout 已纳入批次的设备；其余状态不占用。
+    occupancies = {}
+    for release_id, release in releases.items():
+        if not isinstance(release, dict):
+            raise InvalidState("release %s is corrupted" % release_id)
+        status = release.get("status")
+        if status not in RELEASE_OCCUPYING_STATUSES:
+            continue
+        for device_id, batch_index in occupancy_batch_indices(
+                release, "release %s" % release_id).items():
+            occupancies.setdefault(device_id, []).append({
+                "kind": "release",
+                "id": release_id,
+                "status": status,
+                "batchIndex": batch_index,
+            })
+    for batch_id, rollout in rollouts.items():
+        if not isinstance(rollout, dict):
+            raise InvalidState("batch %s is corrupted" % batch_id)
+        status = rollout.get("status")
+        if status not in BATCH_OCCUPYING_STATUSES:
+            continue
+        for device_id, batch_index in occupancy_batch_indices(
+                rollout, "batch %s" % batch_id).items():
+            occupancies.setdefault(device_id, []).append({
+                "kind": "batch",
+                "id": batch_id,
+                "status": status,
+                "batchIndex": batch_index,
+            })
+    for items in occupancies.values():
+        items.sort(key=lambda item: (item["kind"], item["id"]))
+
+    if selected_ids is None:
+        selected_ids = sorted(devices)
+        for device_id in selected_ids:
+            if not isinstance(device_id, str):
+                raise InvalidState("state file is corrupted")
+    else:
+        for device_id in selected_ids:
+            if device_id not in devices:
+                raise DeviceNotFound("device not found: %s" % device_id)
+
+    stale_boundary = at_instant - timedelta(seconds=timeout_seconds)
+    rows = []
+    for device_id in selected_ids:
+        record = devices.get(device_id, {})
+        if not isinstance(record, dict):
+            raise InvalidState("device record is corrupted: %s" % device_id)
+        heartbeat_text = record.get("heartbeatAt")
+        if heartbeat_text is not None:
+            try:
+                parse_time(heartbeat_text)
+            except InvalidArgument:
+                raise InvalidState("device %s has invalid heartbeatAt" % device_id)
+        row = fleet_device_row(device_id, record, at_instant, stale_boundary)
+        items = occupancies.get(device_id, [])
+        row["occupied"] = len(items) > 0
+        row["conflict"] = len(items) > 1
+        row["occupancies"] = items
+        rows.append(row)
+
+    summary = {
+        "totalDevices": len(devices),
+        "selectedDevices": len(rows),
+        "occupiedCount": sum(1 for row in rows if row["occupied"]),
+        "conflictCount": sum(1 for row in rows if row["conflict"]),
+        "freshCount": sum(1 for row in rows if row["heartbeatState"] == "fresh"),
+        "staleCount": sum(1 for row in rows if row["heartbeatState"] == "stale"),
+        "unknownCount": sum(1 for row in rows if row["heartbeatState"] == "unknown"),
+    }
+    return {
+        "at": format_instant(at_instant),
+        "heartbeatTimeoutSeconds": timeout_seconds,
+        "summary": summary,
+        "devices": rows,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 命令行解析
 # ---------------------------------------------------------------------------
@@ -867,6 +999,19 @@ def build_parser():
                               help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
     fleet_status.set_defaults(handler=cmd_fleet_status, mutating=False)
     add_state_option(fleet_status)
+
+    fleet_occupancy = fleet_sub.add_parser(
+        "occupancy", help="只读解释设备占用（release 与 batch rollout 统一口径）")
+    fleet_occupancy.add_argument("--device-id", action="append", default=None,
+                                 help="只查指定设备，可重复；缺省查询全部设备，"
+                                      "输出均按 device-id 升序")
+    fleet_occupancy.add_argument("--at", default=None,
+                                 help="观察时刻（ISO 8601）；缺省取调用时 UTC")
+    fleet_occupancy.add_argument("--heartbeat-timeout-seconds",
+                                 default=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+                                 help="心跳超时秒数，>=1 的整数（默认 %(default)s）")
+    fleet_occupancy.set_defaults(handler=cmd_fleet_occupancy, mutating=False)
+    add_state_option(fleet_occupancy)
 
     # 批次灰度推进与自动故障回滚（增量子系统），独立于上面的 release 能力。
     from . import batch_rollout

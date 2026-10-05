@@ -52,6 +52,11 @@ python -m ota_canary status --release-id R1
 # 只读查看设备心跳与版本状态（全部设备 / 仅某发布批次）
 python -m ota_canary fleet status \
     [--release-id R1] [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
+
+# 只读解释设备占用（全部设备 / 指定设备）
+python -m ota_canary fleet occupancy \
+    [--device-id d1 --device-id d2] \
+    [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
 ```
 
 行为约定：
@@ -146,6 +151,25 @@ python -m ota_canary fleet status \
   `totalDevices`、`freshCount`、`staleCount`、`unknownCount`、`occupiedCount`。
   空状态返回零计数与空 `devices`；状态损坏返回 `InvalidState`。错误均走 stderr
   JSON、非零退出且不改状态；`status` 与 `release plan` 的既有输出保持不变。
+- `fleet occupancy` 为只读视图，不建批次、不改状态文件，重复调用结果稳定：可选
+  `--device-id`（可重复）、`--at`、`--heartbeat-timeout-seconds`。`--at` 按既有
+  ISO 8601 规则换算 UTC，缺省取调用时 UTC 并以 `Z` 输出；
+  `--heartbeat-timeout-seconds` 默认 `900`，只接受大于等于 `1` 的整数；非法
+  `--at`、非法超时、`--device-id` 空值或重复均返回 `InvalidArgument`。省略
+  `--device-id` 查询全部设备，指定时只查给定设备，输出均按 device-id 升序；
+  指定设备不存在返回 `DeviceNotFound`。成功输出顶层固定为 `at`、
+  `heartbeatTimeoutSeconds`、`summary`、`devices`：每项为 `deviceId`、`version`、
+  `heartbeatAt`、`ageSeconds`、`heartbeatState`、`occupied`、`conflict`、
+  `occupancies`。`ageSeconds` 为观察时刻减 `heartbeatAt` 的向下取整秒，非正为
+  `0`，心跳缺失为 `null`；`heartbeatAt` 严格早于观察时刻减 timeout 时
+  `heartbeatState` 为 `stale`，否则 `fresh`，心跳缺失为 `unknown`。`occupancies`
+  只列活动占用：`in_progress`/`paused` 的 release 与 `in_progress`/`paused`/
+  `failed_stopped` 的 batch rollout 已纳入批次的设备，每项为 `kind`
+  （`release`/`batch`）、`id`、`status`、`batchIndex`（从 1 起的批次号），按
+  kind/id 升序；`occupied` 为 `occupancies` 非空，`conflict` 为占用多于一项，
+  冲突只标记不报错。`summary` 含 `totalDevices`、`selectedDevices`、
+  `occupiedCount`、`conflictCount`、`freshCount`、`staleCount`、`unknownCount`。
+  状态损坏返回 `InvalidState`；错误均走 stderr JSON、非零退出且不改状态文件。
 - `release pause` 仅对 `in_progress` 发布生效：状态改为 `paused`，原样保留
   `batches`、`currentBatch`、`reports`、设备版本与心跳。`release resume` 仅对
   `paused` 发布生效：恢复为 `in_progress`，从同一批次继续，不重建批次或报告。
