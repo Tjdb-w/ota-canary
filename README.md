@@ -49,6 +49,10 @@ python -m ota_canary release abort --release-id R1 \
 # 查看发布状态
 python -m ota_canary status --release-id R1
 
+# 查询发布回滚审计时间线（只读，支持分页）
+python -m ota_canary release timeline --release-id R1 \
+    [--after-sequence N] [--limit M]
+
 # 只读查看设备心跳与版本状态（全部设备 / 仅某发布批次）
 python -m ota_canary fleet status \
     [--release-id R1] [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
@@ -137,6 +141,29 @@ python -m ota_canary fleet rollout-status [--at 2026-10-01T10:00:00Z]
   `stabilizationSeconds` 为 `0` 时保持原推进时机。观察期间设备仍被占用，
   `pause`/`resume` 照常可用，恢复后从原批次与截止时刻继续。
 - `status` 保持只读，不补写超时结果，但 `devices[].report` 可读出 `reason=timeout`。
+- `release timeline` 为发布回滚审计时间线的只读查询：`release create`、`start`、
+  `device report`、`release check`、`pause`、`resume`、`abort` 仅在成功的状态变化
+  后向发布追加严格递增事件；命令失败、只读、幂等重复、迟到均不追加，历史只增不改。
+  事件字段与 UTC `Z` 口径沿用 `batch timeline`：`sequence`（从 1 起严格递增）、
+  `type`、`occurredAt`、`batchIndex`（1 起的当前批序号，空匹配为 `null`）、
+  `deviceId`、`result`、`reason`，未涉及字段为 `null`。事件类型与取值：
+  `create` 追加 `created`；`start` 追加 `started`（空匹配再追加 `finished`）；
+  `device report` 追加 `reported`（`result` 为上报的 success/failure，`reason=null`），
+  收批后按结果同 `check` 追加 `batch_advanced`、`finished` 或先 `stopped` 再
+  `rolled_back`；`check` 先为每台超时设备追加 `timeout_recorded`
+  （`result=failure`、`reason=timeout`），随后收批再推进或停止；`pause`/`resume`
+  追加 `paused`/`resumed`；`abort` 追加 `aborted`（`result=failure`，`reason` 为
+  修剪后的人工原因）并追加 `rolled_back`。`stopped` 为 `result=failure`、
+  `reason=batch_failure_threshold`/`release_failure_threshold`；`rolled_back` 为
+  `result=success`、`reason` 为对应阈值或 `manual_abort`；其余事件
+  `result`/`reason` 为 `null`。`occurredAt` 取显式 `--at`、报告的 `heartbeatAt`
+  或调用时刻。输出 `releaseId`、`nextSequence`、`events`：`events` 按 `sequence`
+  升序且均严格大于 `--after-sequence`（缺省 `0`，须为非负整数），`--limit` 缺省
+  `200`、须为 `1` 到 `1000` 的整数，取最早的条数；`nextSequence` 为下一条事件
+  序号（无事件为 `1`），与分页参数无关。发布不存在返回 `DeviceNotFound`；分页参数
+  非法返回 `InvalidArgument`；时间线状态或事件结构不明返回 `InvalidState`；错误
+  走 stderr JSON、非零退出且不改状态。查询无副作用：旧状态缺时间线时输出
+  `events=[]`、`nextSequence=1`，不回填，后续成功命令从 1 起追加。
 - `fleet status` 为只读视图，不修改状态文件：可选 `--release-id`、`--at`、
   `--heartbeat-timeout-seconds`。`--at` 按既有 ISO 8601 规则换算 UTC（支持 `Z`，
   无偏移按 UTC），缺省取调用时 UTC 并以 `Z` 输出；`--heartbeat-timeout-seconds`
