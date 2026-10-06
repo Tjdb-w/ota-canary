@@ -45,7 +45,7 @@ python -m ota_canary device heartbeat --device-id d2 --version 2.0.0 \
 # 按给定时刻收批：超过心跳超时仍未取得终态的设备记 failure(reason=timeout)
 python -m ota_canary batch check --batch-id B1 --at 2026-10-01T10:00:00Z
 
-# 临时暂停 / 恢复：冻结当前批推进后从原批次继续
+# 手动暂停 / 恢复：暂停后当前批已开始设备仍可完成，恢复后从尚未开始的设备继续
 python -m ota_canary batch pause --batch-id B1 --at 2026-10-01T09:30:00Z
 python -m ota_canary batch resume --batch-id B1 --at 2026-10-01T09:45:00Z
 
@@ -244,37 +244,58 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   执行 abort 返回 `InvalidState`。从 `paused` 止损时时间线 `aborted` 事件的
   `phaseFrom=paused`。
 
-## 临时暂停与恢复（batch pause / batch resume）
+## 手动暂停与恢复（batch pause / batch resume）
 
 - `batch pause --batch-id B1 --at <ISO 8601>` 仅接受 `in_progress` 批次：
-  成功后 `status=paused`，记录 `pausedAt`（`--at` 换算 UTC 后的 `Z` 时间），
+  成功后立即 `status=paused`，记录 `pausedAt`（`--at` 换算 UTC 后的 `Z` 时间），
   并把 `resumedAt` 置空。`batch resume --batch-id B1 --at <ISO 8601>` 仅接受
   `paused` 批次：成功后回到 `in_progress`，记录 `resumedAt`。
-- 批次划分（`batches`）、`currentBatch`、终态报告、设备版本与心跳、回滚数据、
-  阈值/超时/观察策略全部原样保留，恢复后从原批次继续。
-- 暂停期间 `batch report` 与 `batch check` 返回 `InvalidState`：不写报告、
-  不补超时、不推进批次。`batch status` 与 `batch timeline` 仍可只读查询；
-  `device heartbeat` 的既有结果不变：可更新公开设备与当前批心跳，但不改变
-  设备阶段、不生成终态。
+- **暂停冻结范围有限**：进入暂停后不再为尚未开始的设备（后续批次及当前批中
+  尚未派发的设备）发起升级；当前批已经开始（`pending_upgrade`/`upgrading`）的
+  设备允许完成——暂停期间 `batch report` 对当前批设备仍然有效，心跳、版本与
+  终态按既有规则记录；`device heartbeat` 的既有结果不变，同样只更新公开设备
+  与当前批心跳/版本。终态照常计入本批失败率。
+- **自动停止优先于暂停**：暂停期间本批集齐终态且失败率**严格大于**
+  `failure-threshold` 时，自动停止与回滚规则优先执行——批次立即进入既有
+  `failed_stopped` 流程（时间线 `stopped` 事件的 `phaseFrom=paused`），冻结、
+  回滚派发、`rollbackDeadline`、回滚上报与收束口径与非暂停时完全一致。此后
+  再执行 resume 返回 `ConflictState`，再执行 pause 同样返回 `ConflictState`。
+- **暂停不推进**：失败率未越阈时，暂停期间不开下一批——`stabilization-seconds`
+  为 `0` 时本应立即发生的推进也顺延到恢复时；大于 `0` 且暂停前尚未进入观察期
+  时，观察截止时刻不在暂停中起算，在恢复时统一计算（已扣除闭合暂停区间）；
+  暂停前已在观察期内的，`resume` 时按本段暂停与窗口的重叠顺延截止时刻。
+  `batch check` 对 `paused` 批次仍返回 `InvalidState`：不补超时、不推进；
+  观察期推进仍须恢复后由显式 `batch check --at` 严格晚于新截止时刻完成。
+- **恢复继续原策略**：`resume` 成功后从当前批尚未取得终态的设备继续等待/推进，
+  已成功设备不重复处理，已失败或已回滚设备沿用现有处置规则；若本批在暂停期间
+  已集齐终态且未越阈，恢复时刻按原策略收束——`stabilization-seconds=0` 立即
+  开下一批（末批完成 → `completed`），大于 `0` 时进入/继续稳定观察期。
 - **暂停时长不计入心跳超时**：恢复后 `batch check` 的超时判定按
   `at - 暂停重叠时长 > 最近有效心跳 + heartbeat-timeout-seconds` 计算，
-  只读 `status` 的 `waiting_heartbeat` 判定同口径。
-- **暂停时长不计入稳定观察计时**：暂停时若已存在 `stabilizationDeadline`，
-  `resume` 时按本段暂停时长顺延截止时刻；暂停发生在进入观察期之前时，截止时刻
-  在进入观察期时统一扣除暂停时长。恢复后越过新截止时刻仍须由显式
-  `batch check --at` 推进，截止时刻过后未 check 不自动推进。
+  只读 `status` 的 `waiting_heartbeat` 判定同口径；暂停期间 `check` 被拒绝，
+  不会补超时。
 - `batch abort` 接受 `paused`，仍按 `manual_abort` 派发回滚并沿用
-  `rollback_failed`/`rolled_back` 收束。
-- `pause`/`resume` 成功时输出带暂停字段的 `batch status` 视图，并向时间线追加
-  `type=paused` / `type=resumed` 事件（`phaseFrom`/`phaseTo` 分别为
-  `in_progress→paused`、`paused→in_progress`）；失败不追加。
+  `rollback_failed`/`rolled_back` 收束（从 paused 止损时时间线 `aborted`
+  事件的 `phaseFrom=paused`）。
+- 批次划分（`batches`）、`currentBatch`、终态报告、设备版本与心跳、回滚数据、
+  阈值/超时/观察策略全部原样保留；新增状态转换只限制手动暂停与恢复，不绕过
+  失败率阈值，也不扩大或缩小参与统计的设备范围。
+- `pause`/`resume` 成功时输出带暂停字段的 `batch status` 视图（含
+  `processedCount`、`pendingCount`、`lastStatusChangedAt`），并返回
+  `effective=true`；状态冲突不生效时 stderr 返回 `ConflictState`（非零退出、
+  不落盘），不返回视图、不追加事件。
+- 时间线：成功时追加 `type=paused` / `type=resumed`（`phaseFrom`/`phaseTo`
+  分别为 `in_progress→paused`、`paused→in_progress`）；失败不追加。
 - 错误：批次不存在返回 `DeviceNotFound`；`--at` 非法返回 `InvalidArgument`；
-  对非 `in_progress`（含 `paused`、`pending`、各终态）执行 `pause`、对非
-  `paused` 执行 `resume` 返回 `InvalidState`。所有校验通过后才写状态：
-  错误走 stderr JSON、非零退出且不修改状态文件。
-- 可重复暂停/恢复；每次成功追加一对事件。旧状态缺少暂停字段时按从未暂停读取
-  （`paused=false`、`pausedAt=null`、`resumedAt=null`），时间线沿用
-  `nextSequence` 继续追加。
+  **状态冲突统一返回 `ConflictState`**——批次尚未启动（`pending`）、已经停止
+  （`failed_stopped`）、正在回滚（`failed_stopped`）、已经回滚完成
+  （`rolled_back`/`rollback_failed`）、已经完成（`completed`）或已经暂停
+  （`paused`）时执行 `pause`；非 `paused` 状态执行 `resume`。所有校验通过后
+  才写状态：错误走 stderr JSON、非零退出且不修改状态文件。
+- 并发暂停、恢复或推进同一批次时，状态变更串行生效，先完成的合法操作为准，
+  后续冲突返回 `ConflictState`。可重复暂停/恢复（非并发的串行交替）；每次
+  成功追加一对事件。旧状态缺少暂停字段时按从未暂停读取（`paused=false`、
+  `pausedAt=null`、`resumedAt=null`），时间线沿用 `nextSequence` 继续追加。
 
 ## 人工止损字段与校验
 
@@ -293,6 +314,11 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 `rolling_back`、`rollback_succeeded`、`rollback_failed`。
 
 `batch status` 顶层还返回：`completedCount`、`failedCount`、`reportedCount`、
+`processedCount`（已取得升级终态的目标设备数，与 `reportedCount` 同口径；
+回滚处置不改变该计数）、`pendingCount`（待处理设备数 = 目标设备总数
+-`processedCount`，含当前批未取得终态与尚未开始的后续批次设备，启动前为
+全部目标）、`lastStatusChangedAt`（最近一次批次 `status` 变更的 UTC `Z`
+时刻；同状态内的批次推进不更新，旧状态显示 `null`，只读不补写）、
 `currentBatchReportedCount`、`failureRate`（当前推进批次已取得终态设备中的失败占比，
 无终态时为 `null`）、`currentBatch`、`frozen`（后续批次是否已冻结）、
 `paused`（当前是否处于暂停）、`pausedAt`/`resumedAt`（最近一次暂停/恢复时刻，

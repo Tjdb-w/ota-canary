@@ -24,10 +24,15 @@
   或 ROLLBACK_FAILED；
 - 人工止损 ``batch abort`` 对 IN_PROGRESS 与 PAUSED 均可用：立即冻结后续批次、
   拒绝新的升级报告，并向已成功设备下发同样的回滚任务，收束口径与自动停止一致。
-- 临时暂停/恢复 ``batch pause``/``batch resume``：仅 in_progress 可暂停为 paused，
-  仅 paused 可恢复回 in_progress；保留批次划分、当前批、报告、设备版本心跳、回滚
-  数据与策略。暂停期间不推进、不补超时、不接收报告；暂停时长从心跳超时与稳定
-  观察计时中扣除（deadline 在恢复时顺延），恢复后从原批次按原策略继续。
+- 手动暂停/恢复 ``batch pause``/``batch resume``：仅 in_progress 可暂停为 paused，
+  仅 paused 可恢复回 in_progress；状态冲突返回 ConflictState。暂停立即冻结对
+  尚未开始设备的升级派发，但当前批已开始（pending_upgrade/upgrading）的设备仍可
+  上报心跳与终态，终态按现有规则记录并照常计算本批失败率——暂停期间失败率越过
+  阈值时自动停止/回滚规则优先执行（批次进入既有 failed_stopped 流程）；心跳与
+  版本在暂停期间持续接收。未越阈时暂停不推进下一批（含 stabilization-seconds
+  为 0 本应立即推进的情形），推进顺延到恢复后由 batch check 跨越；观察期截止
+  时刻在恢复时顺延暂停时长。恢复只对 paused 生效，从尚未开始的设备继续推进，
+  不重复处理已成功设备；已失败或已回滚设备沿用现有处置规则。
 - 回滚收束时限：``batch create --rollback-timeout-seconds``（>=1 的整数，缺省 900）；
   停止或 abort 派发回滚后仍有 pending 任务时，以停止时刻加策略秒数生成
   ``rollbackDeadline``（无任务为 null）。``batch check --at`` 在 failed_stopped 且
@@ -74,6 +79,12 @@ from . import cli
 
 class BatchConflict(cli.OtaError):
     code = "BatchConflict"
+
+
+class ConflictState(cli.OtaError):
+    """手动暂停/恢复与批次当前状态冲突（暂停只接受 in_progress，恢复只接受 paused）。"""
+
+    code = "ConflictState"
 
 
 class FirmwareNotFound(cli.OtaError):
@@ -212,6 +223,11 @@ def get_rollout(state, batch_id):
         # 沿用既有约定：标识不存在统一返回 DeviceNotFound（release 不存在亦然）。
         raise cli.DeviceNotFound("batch not found: %s" % batch_id)
     return rollout
+
+
+def mark_status_changed(rollout, at_instant):
+    """记录最近一次批次状态（status）变更时刻；同状态内的批次推进不更新。"""
+    rollout["lastStatusChangedAt"] = cli.format_instant(at_instant)
 
 
 def require_policy_batch_size(value):
@@ -441,6 +457,7 @@ def cmd_batch_create(state, args):
         "pausedAt": None,
         "resumedAt": None,
         "pauses": [],
+        "lastStatusChangedAt": None,
         "batches": [],
         "currentBatch": None,
         "currentBatchStartedAt": None,
@@ -449,7 +466,9 @@ def cmd_batch_create(state, args):
     }
     rollouts(state)[batch_id] = rollout
     # 创建成功：追加 created 事件（无显式时刻，取调用时刻）。
-    append_event(rollout, EVENT_CREATED, datetime.now(timezone.utc))
+    created_at = datetime.now(timezone.utc)
+    append_event(rollout, EVENT_CREATED, created_at)
+    mark_status_changed(rollout, created_at)
     return batch_view(state, rollout, at_instant=None)
 
 
@@ -723,6 +742,7 @@ def cmd_batch_start(state, args):
     append_event(rollout, EVENT_STARTED, at_instant,
                  phase_from=STATUS_PENDING, phase_to=STATUS_IN_PROGRESS)
     append_event(rollout, EVENT_BATCH_OPENED, at_instant, batch_index=0)
+    mark_status_changed(rollout, at_instant)
     return batch_view(state, rollout, at_instant=at_instant)
 
 
@@ -784,8 +804,9 @@ def paused_duration_between(rollout, start, end):
 def record_heartbeat(state, rollout, device_id, version, heartbeat_text, at_instant):
     """登记一次有效心跳：同步公开设备入口的版本/心跳，并推进待升级->升级中。
 
-    暂停冻结批次推进：暂停期间仅公开心跳入口可达此处，只刷新心跳与版本，
-    不改变设备阶段（batch report 在暂停时直接拒绝，不会进入本函数）。
+    暂停期间继续接收心跳与版本：当前批已派发（pending_upgrade）的设备收到
+    心跳即视为升级已开始（upgrading），与是否暂停无关；暂停冻结的只是对尚未
+    开始设备（后续批次）的升级派发与批次推进。
     """
     device = state["devices"].get(device_id)
     if device is not None:
@@ -795,7 +816,8 @@ def record_heartbeat(state, rollout, device_id, version, heartbeat_text, at_inst
     if entry is not None:
         entry["lastHeartbeatAt"] = heartbeat_text
         entry["lastVersion"] = version
-        if entry["phase"] == PHASE_PENDING_UPGRADE and rollout["status"] == STATUS_IN_PROGRESS:
+        if entry["phase"] == PHASE_PENDING_UPGRADE \
+                and rollout["status"] in (STATUS_IN_PROGRESS, STATUS_PAUSED):
             entry["phase"] = PHASE_UPGRADING
 
 
@@ -811,8 +833,10 @@ def cmd_batch_report(state, args):
     cli.get_device(state, device_id)  # 设备必须经公开入口登记
     entry = rollout["devices"].get(device_id)
 
-    # 自动停止后冻结：后续批次及未取得终态的设备不再接收升级任务。
-    if rollout["status"] != STATUS_IN_PROGRESS:
+    # 仅进行中或手动暂停的批次接收当前批上报：暂停只冻结对尚未开始设备的升级
+    # 派发，当前批已开始设备的心跳、版本与终态仍按既有规则接收并计入失败率；
+    # 自动停止（failed_stopped）后依旧冻结，后续批次及未取得终态设备不再接收。
+    if rollout["status"] not in (STATUS_IN_PROGRESS, STATUS_PAUSED):
         raise cli.InvalidState(
             "batch %s is not accepting upgrade reports (status: %s)"
             % (batch_id, rollout["status"])
@@ -973,6 +997,14 @@ def finalize_batch_if_ready(state, rollout, at_instant):
     stabilizationDeadline 并保持 in_progress、不开下一批，不自动推进
     （deadline 过后未经 batch check 不推进）；是否越过截止时刻由 check 路径
     另行调用 advance_stabilized_batch_if_due 判定。
+
+    手动暂停期间同样执行失败率判定：暂停不冻结终态记录与统计，本批集齐终态
+    且失败率严格大于阈值时自动停止/回滚规则优先（批次转入既有
+    failed_stopped 流程）。未越阈时暂停不推进下一批、也不开启观察计时：
+    stabilization-seconds 为 0 时本应立即发生的推进顺延到恢复时（由 resume
+    再次调用本函数），大于 0 时观察截止时刻在恢复时统一计算（暂停期间
+    stabilizationDeadline 保持 null；若观察期在暂停前已开始，则保留原截止并
+    由 resume 顺延）。
     """
     current = rollout["currentBatch"]
     group = rollout["batches"][current]
@@ -984,6 +1016,10 @@ def finalize_batch_if_ready(state, rollout, at_instant):
     threshold = Fraction(Decimal(rollout["failureThreshold"]))
     if rate > threshold:
         trigger_failure_stop(state, rollout, at_instant)
+        return
+    # 暂停态：失败率未越阈即冻结在此——不推进、不新开观察窗口；恢复时由
+    # cmd_batch_resume 再次调用本函数继续原策略。
+    if rollout["status"] == STATUS_PAUSED:
         return
     if rollout.get("stabilizationSeconds", 0) > 0:
         # 失败率未超阈值：进入稳定观察期，截止时刻只计算一次（终态与有效心跳此后冻结）。
@@ -1075,6 +1111,7 @@ def advance_or_finish_batch(rollout, at_instant):
         rollout["currentBatchStartedAt"] = None
         append_event(rollout, EVENT_FINISHED, at_instant,
                      phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_COMPLETED)
+        mark_status_changed(rollout, at_instant)
     else:
         promote_batch(rollout, current + 1, at_instant)
         append_event(rollout, EVENT_BATCH_ADVANCED, at_instant, batch_index=current + 1)
@@ -1090,6 +1127,7 @@ def freeze_and_dispatch_rollbacks(rollout, stop_reason, at_instant):
     rollout["frozen"] = True
     rollout["stopReason"] = stop_reason
     rollout["currentBatchStartedAt"] = None
+    mark_status_changed(rollout, at_instant)
     # 冻结即退出观察期：清空观察截止时刻（自动阈值停止与人工 abort 共用本路径）。
     rollout["stabilizationDeadline"] = None
     ordered = sorted(rollout["devices"].items(),
@@ -1124,20 +1162,30 @@ def trigger_failure_stop(state, rollout, at_instant):
     立即置为 failed_stopped；若存在回滚任务，由各设备 rollback-report 收束为
     rolled_back/rollback_failed；若没有需要回滚的设备，保持 failed_stopped 直到
     下一次 batch check（显式收批入口）收束为 rolled_back，保证停止状态外部可见。
+
+    手动暂停期间本批集齐终态且越阈时同样走本路径（自动停止优先于暂停），
+    此时 stopped 事件的 phaseFrom 为 paused。
     """
+    status_before = rollout["status"]
     append_event(rollout, EVENT_STOPPED, at_instant,
-                 phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_FAILED_STOPPED,
+                 phase_from=status_before, phase_to=STATUS_FAILED_STOPPED,
                  reason=STOP_REASON_FAILURE_THRESHOLD)
     freeze_and_dispatch_rollbacks(rollout, "batch_failure_threshold", at_instant)
 
 
 def cmd_batch_pause(state, args):
-    """临时暂停：仅 in_progress 可暂停，冻结当前批推进；校验全过后才写状态。"""
+    """手动暂停：仅 in_progress 可暂停。
+
+    立即进入 paused，不再为尚未开始的设备（后续批次及当前批尚未派发者）
+    发起升级；当前批已开始设备的心跳、版本与终态在暂停期间继续按既有规则
+    接收并计算失败率，越阈时自动停止/回滚优先。批次未启动、已停止、正在
+    回滚、已回滚完成或已暂停时返回 ConflictState。校验全过后才写状态。
+    """
     batch_id = cli.require_id(args.batch_id, "batch-id")
     _, at_instant = cli.require_time(args.at)
     rollout = get_rollout(state, batch_id)
     if rollout["status"] != STATUS_IN_PROGRESS:
-        raise cli.InvalidState(
+        raise ConflictState(
             "batch %s cannot be paused (status: %s)" % (batch_id, rollout["status"])
         )
     at_text = cli.format_instant(at_instant)
@@ -1147,16 +1195,25 @@ def cmd_batch_pause(state, args):
     rollout.setdefault("pauses", []).append({"pausedAt": at_text, "resumedAt": None})
     append_event(rollout, EVENT_PAUSED, at_instant,
                  phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_PAUSED)
-    return batch_view(state, rollout, at_instant=at_instant)
+    mark_status_changed(rollout, at_instant)
+    view = batch_view(state, rollout, at_instant=at_instant)
+    view["effective"] = True
+    return view
 
 
 def cmd_batch_resume(state, args):
-    """从暂停恢复：仅 paused 可恢复，沿用原批次与策略，暂停时长顺延观察截止。"""
+    """从暂停恢复：仅 paused 可恢复，从尚未开始的设备继续，不重复处理已终态设备。
+
+    恢复后沿用原批次与策略：已成功设备不重复处理，已失败/已回滚设备沿用
+    既有处置规则。暂停期间本批已集齐终态且失败率未越阈时，在此刻继续原
+    策略——stabilization-seconds 为 0 立即推进下一批或完成，大于 0 时按
+    扣除暂停时长后的观察截止时刻等待 batch check。其他状态返回 ConflictState。
+    """
     batch_id = cli.require_id(args.batch_id, "batch-id")
     _, at_instant = cli.require_time(args.at)
     rollout = get_rollout(state, batch_id)
     if rollout["status"] != STATUS_PAUSED:
-        raise cli.InvalidState(
+        raise ConflictState(
             "batch %s cannot be resumed (status: %s)" % (batch_id, rollout["status"])
         )
     at_text = cli.format_instant(at_instant)
@@ -1169,8 +1226,11 @@ def cmd_batch_resume(state, args):
         # 兼容旧状态：只有 pausedAt 而无区间记录时补一个闭合区间。
         pause_start_text = rollout.get("pausedAt")
         intervals.append({"pausedAt": pause_start_text, "resumedAt": at_text})
-    # 已在观察期内：截止时刻顺延本段暂停与观察窗口的重叠时长；
-    # 尚未进入观察期（deadline 为 None）时由进入时的计算统一扣除。
+    rollout["status"] = STATUS_IN_PROGRESS
+    rollout["resumedAt"] = at_text
+    # 已在观察期内（暂停发生在集齐终态、进入观察之后）：截止时刻顺延本段
+    # 暂停与观察窗口的重叠时长；暂停期间才集齐终态（deadline 为 null）时，
+    # 由下方 finalize 进入观察期时统一按闭合暂停区间扣除。
     deadline_text = rollout.get("stabilizationDeadline")
     if deadline_text is not None and pause_start_text:
         deadline = shift_deadline_for_interval(
@@ -1179,11 +1239,16 @@ def cmd_batch_resume(state, args):
             cli.parse_time(pause_start_text), at_instant,
         )
         rollout["stabilizationDeadline"] = cli.format_instant(deadline)
-    rollout["status"] = STATUS_IN_PROGRESS
-    rollout["resumedAt"] = at_text
     append_event(rollout, EVENT_RESUMED, at_instant,
                  phase_from=STATUS_PAUSED, phase_to=STATUS_IN_PROGRESS)
-    return batch_view(state, rollout, at_instant=at_instant)
+    mark_status_changed(rollout, at_instant)
+    # 暂停期间本批可能已集齐终态：此刻继续原判定——越阈已在暂停时停止
+    # （状态会是 failed_stopped，不会走到 resume）；未越阈时 stabilization=0
+    # 立即推进/完成，>0 时进入观察期（截止时刻已扣除本段暂停）。
+    finalize_batch_if_ready(state, rollout, at_instant)
+    view = batch_view(state, rollout, at_instant=at_instant)
+    view["effective"] = True
+    return view
 
 
 def cmd_batch_abort(state, args):
@@ -1227,6 +1292,8 @@ def finalize_rollback_if_done(rollout, converge_empty=False, at_instant=None):
             rollout["status"] = STATUS_ROLLED_BACK
             append_event(rollout, EVENT_FINISHED, at_instant,
                          phase_from=STATUS_FAILED_STOPPED, phase_to=STATUS_ROLLED_BACK)
+            if at_instant is not None:
+                mark_status_changed(rollout, at_instant)
         return
     if any(r["state"] == "pending" for r in records):
         return
@@ -1237,6 +1304,8 @@ def finalize_rollback_if_done(rollout, converge_empty=False, at_instant=None):
     )
     append_event(rollout, EVENT_FINISHED, at_instant,
                  phase_from=STATUS_FAILED_STOPPED, phase_to=rollout["status"])
+    if at_instant is not None:
+        mark_status_changed(rollout, at_instant)
 
 
 # ---------------------------------------------------------------------------
@@ -1346,6 +1415,7 @@ def cmd_batch_rollback_retry(state, args):
     rollout["rollbackDeadline"] = cli.format_instant(
         at_instant + timedelta(seconds=timeout_seconds)
     )
+    mark_status_changed(rollout, at_instant)
     rollout["retryDeviceIds"] = list(device_ids)
     rollout["retryStartedAt"] = at_text
     attempts = rollout.setdefault("rollbackAttempts", [])
@@ -1511,6 +1581,14 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
         "currentBatchStartedAt": rollout.get("currentBatchStartedAt"),
         "batchCount": len(rollout["batches"]),
         "batches": rollout["batches"],
+        # 已处理 = 已取得升级终态（成功/失败）的目标设备数；待处理 = 目标总数
+        # 减去已处理（含当前批未终态与尚未开始的后续批次设备；启动前为全部目标）。
+        # 回滚处置不改变这两个计数：已成功设备即使进入回滚仍计为已处理。
+        "processedCount": reported,
+        "pendingCount": len(rollout["targetDeviceIds"]) - reported,
+        # 最近一次批次状态（status）变更时刻；同状态内的批次推进不更新。
+        # 旧状态缺该字段时显示 null，只读不补写历史。
+        "lastStatusChangedAt": rollout.get("lastStatusChangedAt"),
         "completedCount": succeeded,
         "failedCount": failed,
         "reportedCount": reported,
@@ -2114,13 +2192,17 @@ def register_parsers(subparsers, add_state_option):
     batch_check.set_defaults(handler=cmd_batch_check, mutating=True)
     add_state_option(batch_check)
 
-    batch_pause = batch_sub.add_parser("pause", help="临时暂停进行中的批次，冻结当前批推进")
+    batch_pause = batch_sub.add_parser(
+        "pause",
+        help="手动暂停进行中的批次：不再派发尚未开始的设备，当前批已开始设备仍可完成")
     batch_pause.add_argument("--batch-id", required=True)
     batch_pause.add_argument("--at", required=True, help="暂停时刻（ISO 8601）")
     batch_pause.set_defaults(handler=cmd_batch_pause, mutating=True)
     add_state_option(batch_pause)
 
-    batch_resume = batch_sub.add_parser("resume", help="从原批次恢复已暂停的批次")
+    batch_resume = batch_sub.add_parser(
+        "resume",
+        help="恢复已暂停的批次：从尚未开始的设备继续，已成功设备不重复处理")
     batch_resume.add_argument("--batch-id", required=True)
     batch_resume.add_argument("--at", required=True, help="恢复时刻（ISO 8601）")
     batch_resume.set_defaults(handler=cmd_batch_resume, mutating=True)
