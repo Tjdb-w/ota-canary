@@ -580,12 +580,12 @@ def cmd_device_report(state, args):
     return view
 
 
-def cmd_release_check(state, args):
-    release_id = require_id(args.release_id, "release-id")
-    release = get_release(state, release_id)
-    _, at_instant = require_time(args.at)
-    if release["status"] != "in_progress":
-        raise InvalidState("release %s is not in progress (status: %s)" % (release_id, release["status"]))
+def run_release_check(state, release, at_instant):
+    """release check 的收批核心：超时补写 + 收批判定，返回补写超时的设备（升序）。
+
+    仅处理 in_progress 发布（状态前置校验由调用方完成）；release check 与
+    fleet check 共用本函数，判定口径完全一致。
+    """
     timeout = timedelta(
         seconds=release.get("heartbeatTimeoutSeconds", DEFAULT_HEARTBEAT_TIMEOUT_SECONDS)
     )
@@ -614,6 +614,16 @@ def cmd_release_check(state, args):
             expired.append(device_id)
     expired.sort()
     advance_if_batch_complete(state, release, at_instant=at_instant)
+    return expired
+
+
+def cmd_release_check(state, args):
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    _, at_instant = require_time(args.at)
+    if release["status"] != "in_progress":
+        raise InvalidState("release %s is not in progress (status: %s)" % (release_id, release["status"]))
+    expired = run_release_check(state, release, at_instant)
     view = release_view(state, release)
     view["expiredDevices"] = expired
     return view
@@ -1096,6 +1106,12 @@ def batch_rollout_status_handler(state, args):
     return batch_rollout.cmd_fleet_rollout_status(state, args)
 
 
+def fleet_check_handler(state, args):
+    """fleet check 转发到批次子系统的集中定时收批实现（写命令，一次持久化）。"""
+    from . import batch_rollout
+    return batch_rollout.cmd_fleet_check(state, args)
+
+
 # ---------------------------------------------------------------------------
 # 命令行解析
 # ---------------------------------------------------------------------------
@@ -1252,6 +1268,13 @@ def build_parser():
     fleet_rollout_status.set_defaults(
         handler=batch_rollout_status_handler, mutating=False)
     add_state_option(fleet_rollout_status)
+
+    fleet_check = fleet_sub.add_parser(
+        "check", help="集中执行活动发布/批次的定时收批（写命令，一次持久化）")
+    fleet_check.add_argument("--at", required=True,
+                             help="唯一观察时刻（ISO 8601），必须显式提供")
+    fleet_check.set_defaults(handler=fleet_check_handler, mutating=True)
+    add_state_option(fleet_check)
 
     # 批次灰度推进与自动故障回滚（增量子系统），独立于上面的 release 能力。
     from . import batch_rollout
