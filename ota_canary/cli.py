@@ -38,6 +38,11 @@ RELEASE_EVENT_POLICY_UPDATED = "policy_updated"
 RELEASE_TIMELINE_DEFAULT_LIMIT = 200
 RELEASE_TIMELINE_MAX_LIMIT = 1000
 
+# device timeline（跨 release 与 batch rollout 的设备事件汇总）查询的默认与上限
+DEVICE_TIMELINE_DEFAULT_OFFSET = 0
+DEVICE_TIMELINE_DEFAULT_LIMIT = 200
+DEVICE_TIMELINE_MAX_LIMIT = 1000
+
 # ---------------------------------------------------------------------------
 # 跨子系统设备占用（release 与 batch rollout 统一口径）
 # ---------------------------------------------------------------------------
@@ -923,6 +928,157 @@ def cmd_release_timeline(state, args):
     }
 
 
+# ---------------------------------------------------------------------------
+# device 审计时间线只读查询（跨 releases 与 batchRollouts 汇总）
+# ---------------------------------------------------------------------------
+
+def require_device_timeline_offset(value):
+    """--offset：缺省 0；非负整数，否则 InvalidArgument。"""
+    if value is None:
+        return DEVICE_TIMELINE_DEFAULT_OFFSET
+    try:
+        offset = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise InvalidArgument(
+            "offset must be a non-negative integer: %r" % (value,)
+        )
+    if offset < 0:
+        raise InvalidArgument(
+            "offset must be a non-negative integer: %r" % (value,)
+        )
+    return offset
+
+
+def require_device_timeline_limit(value):
+    """--limit：缺省 200；1 到 1000 的整数，否则 InvalidArgument。"""
+    if value is None:
+        return DEVICE_TIMELINE_DEFAULT_LIMIT
+    try:
+        limit = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise InvalidArgument(
+            "limit must be an integer between 1 and %d: %r"
+            % (DEVICE_TIMELINE_MAX_LIMIT, value)
+        )
+    if limit < 1 or limit > DEVICE_TIMELINE_MAX_LIMIT:
+        raise InvalidArgument(
+            "limit must be an integer between 1 and %d: %r"
+            % (DEVICE_TIMELINE_MAX_LIMIT, value)
+        )
+    return limit
+
+
+def device_timeline_event_view(source_type, source_id, event):
+    """按固定字段顺序输出一条设备事件；sourceType 为 release/batch。
+
+    sourceId、sourceSequence 取来源标识与来源事件 sequence，其余字段沿用
+    来源原事件值，缺失补 None。
+    """
+    return {
+        "sourceType": source_type,
+        "sourceId": source_id,
+        "sourceSequence": event.get("sequence"),
+        "type": event.get("type"),
+        "occurredAt": event.get("occurredAt"),
+        "batchIndex": event.get("batchIndex"),
+        "result": event.get("result"),
+        "phaseFrom": event.get("phaseFrom"),
+        "phaseTo": event.get("phaseTo"),
+        "reason": event.get("reason"),
+    }
+
+
+def _device_timeline_source_events(state, source_type, bucket_key, device_id):
+    """从一个来源子系统收集 deviceId 匹配的原事件；结构损坏 -> InvalidState。
+
+    只取 deviceId 等于指定设备的设备级事件，排除总体事件；事件必须为对象、
+    来源 sequence 必须为整数（含 bool 排除），occurredAt 必须为可解析时间。
+    来源 bucket 或 events 缺失按空集读取，不回填。
+    """
+    bucket = state.get(bucket_key)
+    if bucket is None:
+        return []
+    if not isinstance(bucket, dict):
+        raise InvalidState("state file %s is corrupted" % bucket_key)
+    collected = []
+    for source_id, source in bucket.items():
+        if not isinstance(source_id, str) or not isinstance(source, dict):
+            raise InvalidState("state file %s is corrupted" % bucket_key)
+        if "events" not in source:
+            # 旧状态缺时间线：按空集读取，不回填、不视为损坏。
+            continue
+        events = source["events"]
+        if not isinstance(events, list):
+            raise InvalidState("%s %s timeline is corrupted" % (source_type, source_id))
+        for event in events:
+            if not isinstance(event, dict):
+                raise InvalidState("%s %s timeline is corrupted" % (source_type, source_id))
+            sequence = event.get("sequence")
+            if not isinstance(sequence, int) or isinstance(sequence, bool):
+                raise InvalidState("%s %s timeline is corrupted" % (source_type, source_id))
+            # 任一时间线结构损坏即 InvalidState：occurredAt 是排序键，先于设备
+            # 过滤对所有事件（含总体事件与其他设备事件）统一校验。
+            occurred_at = event.get("occurredAt")
+            try:
+                instant = parse_time(occurred_at)
+            except InvalidArgument:
+                raise InvalidState("%s %s timeline is corrupted" % (source_type, source_id))
+            if event.get("deviceId") != device_id:
+                continue
+            collected.append((source_type, source_id, sequence, instant, event))
+    return collected
+
+
+def cmd_device_timeline(state, args):
+    """只读汇总设备在 release 与 batch rollout 中的设备级审计事件。
+
+    设备不存在 DeviceNotFound；offset/limit 非法 InvalidArgument；状态整体非
+    对象或任一时间线结构损坏 InvalidState。不落盘、不回填。无匹配事件返回空
+    events、total 0、nextOffset null。
+    """
+    device_id = require_id(args.device_id, "device-id")
+    # 设备存在性先于分页参数与时间线结构校验：设备不存在返回 DeviceNotFound。
+    device = get_device(state, device_id)
+    offset = require_device_timeline_offset(args.offset)
+    limit = require_device_timeline_limit(args.limit)
+
+    releases = state.get("releases")
+    rollouts = state.get("batchRollouts")
+    if not isinstance(releases, dict):
+        raise InvalidState("state file releases is corrupted")
+    if rollouts is not None and not isinstance(rollouts, dict):
+        raise InvalidState("state file batchRollouts is corrupted")
+
+    items = _device_timeline_source_events(state, "release", "releases", device_id)
+    items += _device_timeline_source_events(state, "batch", "batchRollouts", device_id)
+
+    # 排序：occurredAt 升序；同时刻 release 先于 batch；再按 sourceId 码点升序；
+    # 最后按 sourceSequence 升序。
+    items.sort(key=lambda item: (
+        item[3], 0 if item[0] == "release" else 1, item[1], item[2]
+    ))
+
+    total = len(items)
+    page = items[offset:offset + limit]
+    returned = len(page)
+    next_offset = offset + returned if offset + returned < total else None
+    return {
+        "device": {
+            "deviceId": device_id,
+            "version": device.get("version"),
+            "heartbeatAt": device.get("heartbeatAt"),
+        },
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "nextOffset": next_offset,
+        "events": [
+            device_timeline_event_view(source_type, source_id, event)
+            for source_type, source_id, _sequence, _instant, event in page
+        ],
+    }
+
+
 def fleet_device_row(device_id, device, at_instant, stale_boundary):
     """构造单设备的 fleet status 行；心跳时间已由调用方校验为 UTC 瞬间或 None。"""
     heartbeat_text = device.get("heartbeatAt")
@@ -1213,6 +1369,16 @@ def build_parser():
     device_report.add_argument("--heartbeat-at", required=True)
     device_report.set_defaults(handler=cmd_device_report, mutating=True)
     add_state_option(device_report)
+
+    device_timeline = device_sub.add_parser(
+        "timeline", help="只读汇总设备在 release 与 batch rollout 中的审计事件")
+    device_timeline.add_argument("--device-id", required=True)
+    device_timeline.add_argument("--offset", default=None,
+                                 help="跳过前 N 条过滤后事件，非负整数（默认 0）")
+    device_timeline.add_argument("--limit", default=None,
+                                 help="返回的事件条数，1 到 1000 的整数（默认 200）")
+    device_timeline.set_defaults(handler=cmd_device_timeline, mutating=False)
+    add_state_option(device_timeline)
 
     release = subparsers.add_parser("release", help="发布创建与启动")
     release_sub = release.add_subparsers(dest="release_command")

@@ -57,6 +57,10 @@ python -m ota_canary status --release-id R1
 python -m ota_canary release timeline --release-id R1 \
     [--after-sequence 0] [--limit 200]
 
+# 只读汇总单台设备在 release 与 batch rollout 中的审计事件（分页）
+python -m ota_canary device timeline --device-id d1 \
+    [--offset 0] [--limit 200]
+
 # 只读查看设备心跳与版本状态（全部设备 / 仅某发布批次）
 python -m ota_canary fleet status \
     [--release-id R1] [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
@@ -333,6 +337,28 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
     存在但非列表、事件非对象或 `sequence` 非整数）返回 `InvalidState`。错误均走
     stderr JSON、非零退出且不改状态。查询无副作用；旧状态缺时间线时输出
     `events=[]`、`nextSequence=1`，不回填，后续成功写命令从 1 起追加。
+- `device timeline --device-id <id> [--offset N] [--limit M]` 是单台设备的只读
+  跨子系统审计时间线汇总，不写审计记录、不改变写命令的输出、幂等与落盘行为，
+  重复调用结果稳定。事件只取 `releases` 与 `batchRollouts` 中 `deviceId` 等于
+  指定设备的原事件，排除总体事件（如 `created`/`started`/`batch_opened`）与任何
+  虚构心跳；两个来源桶、单个来源或其 `events` 缺失时按空集读取，不回填。
+  成功输出顶层固定为 `device`、`total`、`offset`、`limit`、`nextOffset`、`events`：
+  - `device` 为 `{deviceId, version, heartbeatAt}`，取设备当前记录，字段缺失为 `null`。
+  - 每条事件固定为 `sourceType`（`release` 或 `batch`）、`sourceId`（releaseId/
+    batchId）、`sourceSequence`（来源事件的 `sequence`）、`type`、`occurredAt`、
+    `batchIndex`、`result`、`phaseFrom`、`phaseTo`、`reason`；除前三个来源字段外
+    其余沿用来源事件原值，缺失为 `null`。
+  - 排序按 `occurredAt` 升序；同一时刻 `release` 先于 `batch`；再按 `sourceId`
+    码点升序；最后按 `sourceSequence` 升序。
+  - `--offset` 为非负整数（缺省 0）；`--limit` 缺省 200，为 1 到 1000 的整数。
+    `total` 为过滤后事件总数；`events` 为 `offset` 之后的至多 `limit` 条；
+    `nextOffset` 为 `offset` 加本次返回条数，取完（或无更多事件）时为 `null`。
+  - 设备不存在返回 `DeviceNotFound`；`--offset`/`--limit` 非法返回 `InvalidArgument`；
+    状态文件不可读、整体非对象，或任一时间线结构损坏（来源桶非对象、来源非对象、
+    `events` 存在但非列表、事件非对象、`sequence` 非整数或 `occurredAt` 非法）返回
+    `InvalidState`，总体事件与其他设备事件中的结构损坏同样判为损坏。错误均走 stderr
+    JSON、非零退出且不改状态。无匹配事件时 `events` 为 `[]`、`total` 为 0、
+    `nextOffset` 为 `null`。
 - 已超时设备或非当前批设备的迟到 `device report` 返回 `InvalidArgument`。
 - 成功的写命令输出 JSON 并持久化状态；`status` 与 `release plan` 为只读，不产生业务变化。
 - 失败命令以非零退出码结束，向 stderr 输出 JSON 错误，且不修改状态文件。
