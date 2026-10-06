@@ -895,30 +895,20 @@ def cmd_batch_report(state, args):
                       result=result, heartbeat_at=heartbeat_text, version=version)
 
 
-def cmd_batch_check(state, args):
-    batch_id = cli.require_id(args.batch_id, "batch-id")
-    rollout = get_rollout(state, batch_id)
-    _, at_instant = cli.require_time(args.at)
-    if rollout["status"] == STATUS_PAUSED:
-        # 暂停冻结：不补超时、不推进，观察期截止时刻在恢复时才顺延。
-        raise cli.InvalidState(
-            "batch %s is paused and cannot be checked (status: %s)"
-            % (batch_id, rollout["status"])
-        )
+def batch_check_apply(state, rollout, at_instant):
+    """batch check 的收批主体（fleet check 集中收批复用同一规则）。
+
+    仅处理 in_progress（超时补写、失败阈值、稳定观察、自动停止与回滚派发）与
+    failed_stopped（回滚任务超时收束与终态收束）批次；paused 等其他状态由
+    调用方拦截。返回 ``(expired, rollback_expired)``，两者均按 device-id 升序。
+    """
     if rollout["status"] == STATUS_FAILED_STOPPED:
         # 回滚收束时限：at 严格晚于 rollbackDeadline 时把 pending 回滚任务收束为
         # failure(reason=timeout)；无回滚任务的停止态在显式收批入口再次到达时收束为
         # rolled_back；仍有 pending 回滚任务时保持 failed_stopped，等待 rollback-report。
         rollback_expired = apply_rollback_timeouts(rollout, at_instant)
         finalize_rollback_if_done(rollout, converge_empty=True, at_instant=at_instant)
-        view = batch_view(state, rollout, at_instant=at_instant)
-        view["expiredDevices"] = []
-        view["rollbackExpiredDeviceIds"] = rollback_expired
-        return view
-    if rollout["status"] != STATUS_IN_PROGRESS:
-        raise cli.InvalidState(
-            "batch %s is not in progress (status: %s)" % (batch_id, rollout["status"])
-        )
+        return [], rollback_expired
     timeout = timedelta(seconds=rollout["heartbeatTimeoutSeconds"])
     current = rollout["currentBatch"]
     expired = []
@@ -952,9 +942,27 @@ def cmd_batch_check(state, args):
     # 观察期仅由显式收批入口跨越：at 严格晚于 stabilizationDeadline 才推进，
     # 等于或更早保持不变；deadline 过后未 check 不自动推进。
     advance_stabilized_batch_if_due(rollout, at_instant)
+    return expired, []
+
+
+def cmd_batch_check(state, args):
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    rollout = get_rollout(state, batch_id)
+    _, at_instant = cli.require_time(args.at)
+    if rollout["status"] == STATUS_PAUSED:
+        # 暂停冻结：不补超时、不推进，观察期截止时刻在恢复时才顺延。
+        raise cli.InvalidState(
+            "batch %s is paused and cannot be checked (status: %s)"
+            % (batch_id, rollout["status"])
+        )
+    if rollout["status"] not in (STATUS_IN_PROGRESS, STATUS_FAILED_STOPPED):
+        raise cli.InvalidState(
+            "batch %s is not in progress (status: %s)" % (batch_id, rollout["status"])
+        )
+    expired, rollback_expired = batch_check_apply(state, rollout, at_instant)
     view = batch_view(state, rollout, at_instant=at_instant)
     view["expiredDevices"] = expired
-    view["rollbackExpiredDeviceIds"] = []
+    view["rollbackExpiredDeviceIds"] = rollback_expired
     return view
 
 
@@ -2087,6 +2095,176 @@ def cmd_fleet_rollout_status(state, args):
         "at": cli.format_instant(at_instant),
         "summary": summary,
         "campaigns": campaigns,
+    }
+
+
+# ---------------------------------------------------------------------------
+# fleet check：集中执行活动定时收批（release 与 batch rollout 单一观察时刻）
+# ---------------------------------------------------------------------------
+
+def _validate_check_events(events, ref):
+    """审计事件列表结构：缺省允许；存在即必须为事件对象列表且 sequence 为整数。"""
+    if events is None:
+        return
+    if not isinstance(events, list):
+        _corrupted(ref)
+    for event in events:
+        if not isinstance(event, dict) \
+                or not isinstance(event.get("sequence"), int) \
+                or isinstance(event.get("sequence"), bool):
+            _corrupted(ref)
+
+
+def _validate_check_release(state, release_id, release, at_instant):
+    """fleet check 写前预检单个 release：复用风险总览的结构校验并补齐收批路径字段。"""
+    ref = "release %s" % release_id
+    # 复用只读总览的结构口径：状态、版本、批次、reports、当前批、超时秒数、
+    # stabilizationDeadline、stopReason 等均已覆盖。
+    _release_campaign(state, release_id, release, at_instant)
+    max_failure = release.get("maxFailurePercent")
+    if not isinstance(max_failure, int) or isinstance(max_failure, bool) \
+            or not 0 <= max_failure <= 100:
+        _corrupted(ref)
+    max_release = release.get("maxReleaseFailurePercent")
+    if max_release is not None and (
+            not isinstance(max_release, int) or isinstance(max_release, bool)
+            or not 0 <= max_release <= 100):
+        _corrupted(ref)
+    stabilization = release.get("stabilizationSeconds", 0)
+    if not isinstance(stabilization, int) or isinstance(stabilization, bool) \
+            or stabilization < 0:
+        _corrupted(ref)
+    reports = release.get("reports", {})
+    for report in reports.values():
+        if report.get("result") not in ("success", "failure"):
+            _corrupted(ref)
+    _validate_check_events(release.get("events"), ref)
+
+
+def _validate_check_batch(state, batch_id, rollout, at_instant):
+    """fleet check 写前预检单个 batch rollout：覆盖收批、停止与回滚超时路径。"""
+    ref = "batch %s" % batch_id
+    # 复用只读总览的结构口径：状态、版本、目标、批次、当前批、设备条目、
+    # 终态/回滚记录、lastHeartbeatAt、currentBatchStartedAt、截止时刻等。
+    _batch_campaign(state, batch_id, rollout, at_instant)
+    threshold_text = rollout.get("failureThreshold")
+    try:
+        threshold = Decimal(str(threshold_text))
+    except InvalidOperation:
+        _corrupted(ref)
+    if not threshold.is_finite() or not Decimal(0) < threshold < Decimal(1):
+        _corrupted(ref)
+    stabilization = rollout.get("stabilizationSeconds", 0)
+    if not isinstance(stabilization, int) or isinstance(stabilization, bool) \
+            or stabilization < 0:
+        _corrupted(ref)
+    # 收批可能在本次检查中新触发自动停止，届时按 rollbackTimeoutSeconds 生成截止时刻。
+    rollback_timeout = rollout.get(
+        "rollbackTimeoutSeconds", DEFAULT_ROLLBACK_TIMEOUT_SECONDS
+    )
+    if not isinstance(rollback_timeout, int) or isinstance(rollback_timeout, bool) \
+            or rollback_timeout < 1:
+        _corrupted(ref)
+    _validate_check_events(rollout.get("events"), ref)
+    pauses = rollout.get("pauses")
+    if pauses is not None:
+        if not isinstance(pauses, list):
+            _corrupted(ref)
+        for item in pauses:
+            if not isinstance(item, dict):
+                _corrupted(ref)
+            _optional_time(item.get("pausedAt"), ref, "pausedAt")
+            _optional_time(item.get("resumedAt"), ref, "resumedAt")
+    # 收批主体按批次设备直查 entries：每个纳入批次的设备都必须有条目。
+    entries = rollout.get("devices", {})
+    for group in rollout.get("batches", []):
+        for device_id in group:
+            entry = entries.get(device_id)
+            if not isinstance(entry, dict):
+                _corrupted(ref)
+
+
+def cmd_fleet_check(state, args):
+    """集中执行活动定时收批：单一观察时刻，跨 release 与 batch rollout 一次落盘。
+
+    先按 releaseId 升序处理全部 in_progress release（沿用 release check 的超时
+    补写、稳定观察、失败阈值、自动停止与回滚规则），再按 batchId 升序处理
+    in_progress/failed_stopped 的 batch rollout（沿用 batch check 的超时补写、
+    观察推进、自动停止、回滚任务派发与回滚超时收束规则）。其余状态对象只进入
+    skipped，不接受升级或回滚上报。任何对象结构非法、设备表损坏或时间口径冲突
+    都在写入前抛出 InvalidState，状态文件保持不变；旧状态缺 batchRollouts、
+    firmwares 或字段时按既有缺省读取，不回填。
+    """
+    _, at_instant = cli.require_time(args.at)
+
+    devices = state.get("devices")
+    releases = state.get("releases")
+    # 不经过会回填缺失键的 rollouts()/firmwares() 访问器：缺键按缺省读取且不回填。
+    rollouts_map = state.get("batchRollouts", {})
+    if not isinstance(devices, dict) or not isinstance(releases, dict) \
+            or not isinstance(rollouts_map, dict):
+        _corrupted("state file")
+
+    # 写入前全量结构预检：设备表、全部 release 与全部 batch rollout（含仅进入
+    # skipped 的对象），任何非法都在首次状态变更前失败。
+    _validate_device_table(devices)
+    for release_id, release in releases.items():
+        if not isinstance(release_id, str) or not isinstance(release, dict):
+            _corrupted("state file")
+        _validate_check_release(state, release_id, release, at_instant)
+    for batch_id, rollout in rollouts_map.items():
+        if not isinstance(batch_id, str) or not isinstance(rollout, dict):
+            _corrupted("state file")
+        _validate_check_batch(state, batch_id, rollout, at_instant)
+
+    campaigns = []
+    skipped = []
+
+    # 先 release（releaseId 升序），再 batch rollout（batchId 升序）。
+    for release_id in sorted(releases):
+        release = releases[release_id]
+        if release.get("status") == STATUS_IN_PROGRESS:
+            expired = cli.release_check_apply(state, release, at_instant)
+            campaigns.append({
+                "kind": "release",
+                "id": release_id,
+                "status": release["status"],
+                "expiredDevices": expired,
+                "rollbackExpiredDeviceIds": [],
+                "stopReason": release.get("stopReason"),
+            })
+        else:
+            # paused/pending/completed/rolled_back：只记录跳过，不接受任何上报。
+            skipped.append({
+                "kind": "release",
+                "id": release_id,
+                "status": release.get("status"),
+            })
+
+    for batch_id in sorted(rollouts_map):
+        rollout = rollouts_map[batch_id]
+        if rollout.get("status") in (STATUS_IN_PROGRESS, STATUS_FAILED_STOPPED):
+            expired, rollback_expired = batch_check_apply(state, rollout, at_instant)
+            campaigns.append({
+                "kind": "batch",
+                "id": batch_id,
+                "status": rollout["status"],
+                "expiredDevices": expired,
+                "rollbackExpiredDeviceIds": rollback_expired,
+                "stopReason": rollout.get("stopReason"),
+            })
+        else:
+            # paused/pending/completed/rolled_back/rollback_failed：只记录跳过。
+            skipped.append({
+                "kind": "batch",
+                "id": batch_id,
+                "status": rollout.get("status"),
+            })
+
+    return {
+        "at": cli.format_instant(at_instant),
+        "campaigns": campaigns,
+        "skipped": skipped,
     }
 
 

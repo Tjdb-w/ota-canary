@@ -64,6 +64,9 @@ python -m ota_canary fleet occupancy \
 
 # 只读跨子系统风险总览（release 与 batch rollout 的活动发布）
 python -m ota_canary fleet rollout-status [--at 2026-10-01T10:00:00Z]
+
+# 集中执行活动定时收批（单一观察时刻，一次落盘）
+python -m ota_canary fleet check --at 2026-10-01T10:00:00Z [--state <路径>]
 ```
 
 行为约定：
@@ -220,6 +223,28 @@ python -m ota_canary fleet rollout-status [--at 2026-10-01T10:00:00Z]
   状态损坏或语义不明（非字典状态、未知状态、批次/报告/回滚记录结构损坏、
   时间戳非法等）返回 `InvalidState`；错误均走 stderr JSON、非零退出且不改
   状态文件。
+- `fleet check --at <时刻>` 是活动定时收批的集中入口，沿用既有状态文件与
+  `--state`（子命令前后均可），`--at` 必须显式提供且是唯一观察时刻（ISO 8601，
+  支持 `Z`，无偏移按 UTC，统一以 UTC `Z` 输出）；非法时刻返回 `InvalidArgument`。
+  处理顺序固定：先按 `releaseId` 升序处理全部 `in_progress` release，再按
+  `batchId` 升序处理 `batchRollouts` 中 `in_progress`、`failed_stopped` 的批次；
+  `paused`、`pending`、`completed`、`rolled_back`、`rollback_failed` 的对象只
+  进入 `skipped`，不接受升级或回滚上报。入选对象完全沿用各自 `check` 的规则：
+  release 的超时补写、稳定观察、逐批与发布级失败阈值、自动停止回滚；batch 的
+  超时补写（扣除已闭合暂停时长）、稳定观察推进、失败阈值自动停止、回滚任务派发
+  与回滚超时收束；所有截止时刻均要求 `at` 严格越过才推进或收束，等于或更早
+  保持不变。成功输出顶层固定为 `at`、`campaigns`、`skipped`：`campaigns` 按
+  上述处理顺序列出每项 `kind`（`release`/`batch`）、`id`、`status`（处理后的
+  最新状态）、`expiredDevices`（本次心跳超时补写设备，release 与 in_progress
+  batch 使用，按 device-id 升序，无事件为 `[]`）、`rollbackExpiredDeviceIds`
+  （failed_stopped batch 本次回滚超时收束设备，升序，无事件为 `[]`；release
+  恒为 `[]`）、`stopReason`（无停止原因为 `null`）；`skipped` 每项为 `kind`、
+  `id`、`status`，release 按 id 升序后跟 batch 按 id 升序。全部对象处理完成后
+  才一次持久化；对象状态结构非法、设备表损坏或时间口径冲突时返回 `InvalidState`，
+  退出码非零、stderr 输出 JSON 且不改动状态文件；成功退出码为 0。旧状态缺少
+  `batchRollouts`、`firmwares` 或其他字段时按既有缺省读取，不回填。
+  `fleet status`、`fleet occupancy`、`fleet rollout-status` 的输出与只读无
+  副作用语义保持不变，其他既有写命令的单活动语义也不受影响。
 - `release pause` 仅对 `in_progress` 发布生效：状态改为 `paused`，原样保留
   `batches`、`currentBatch`、`reports`、设备版本与心跳。`release resume` 仅对
   `paused` 发布生效：恢复为 `in_progress`，从同一批次继续，不重建批次或报告。
