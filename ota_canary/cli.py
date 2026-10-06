@@ -20,6 +20,23 @@ DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 900
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 VALID_RESULTS = ("success", "failure")
 
+# release 审计时间线事件类型（字段结构与 batch timeline 完全一致）
+RELEASE_EVENT_CREATED = "created"
+RELEASE_EVENT_STARTED = "started"
+RELEASE_EVENT_REPORTED = "reported"
+RELEASE_EVENT_TIMEOUT_RECORDED = "timeout_recorded"
+RELEASE_EVENT_BATCH_ADVANCED = "batch_advanced"
+RELEASE_EVENT_FINISHED = "finished"
+RELEASE_EVENT_PAUSED = "paused"
+RELEASE_EVENT_RESUMED = "resumed"
+RELEASE_EVENT_STOPPED = "stopped"
+RELEASE_EVENT_ROLLED_BACK = "rolled_back"
+RELEASE_EVENT_ABORTED = "aborted"
+
+# release timeline 查询的默认与上限
+RELEASE_TIMELINE_DEFAULT_LIMIT = 200
+RELEASE_TIMELINE_MAX_LIMIT = 1000
+
 # ---------------------------------------------------------------------------
 # 跨子系统设备占用（release 与 batch rollout 统一口径）
 # ---------------------------------------------------------------------------
@@ -345,6 +362,36 @@ def get_device(state, device_id):
 
 
 # ---------------------------------------------------------------------------
+# release 审计时间线：成功命令追加严格递增事件，只增不改
+# ---------------------------------------------------------------------------
+
+def append_release_event(release, event_type, occurred_at, batch_index=None,
+                         device_id=None, result=None, phase_from=None,
+                         phase_to=None, reason=None):
+    """向发布追加一条审计事件；sequence 从 1 起严格递增，未涉及字段为 None。
+
+    仅在命令成功路径调用；失败、只读、幂等重复、迟到均不追加。occurred_at 为
+    已校验的 UTC 瞬间（显式 --at、心跳时刻或调用时刻），统一格式化为 Z 后缀。
+    旧状态缺 timeline（events）时不回填：首次成功写命令从此以 sequence=1 追加。
+    """
+    events = release.get("events")
+    if not isinstance(events, list):
+        events = []
+        release["events"] = events
+    events.append({
+        "sequence": len(events) + 1,
+        "type": event_type,
+        "occurredAt": format_instant(occurred_at),
+        "batchIndex": batch_index,
+        "deviceId": device_id,
+        "result": result,
+        "phaseFrom": phase_from,
+        "phaseTo": phase_to,
+        "reason": reason,
+    })
+
+
+# ---------------------------------------------------------------------------
 # 命令处理
 # ---------------------------------------------------------------------------
 
@@ -407,8 +454,11 @@ def cmd_release_create(state, args):
         "batches": [],
         "currentBatch": 0,
         "reports": {},
+        "events": [],
     }
     state["releases"][release_id] = release
+    # 创建成功：追加 created 事件（无显式时刻，取调用时刻）。
+    append_release_event(release, RELEASE_EVENT_CREATED, datetime.now(timezone.utc))
     return release_view(state, release)
 
 
@@ -462,7 +512,19 @@ def cmd_release_start(state, args):
     release["batches"] = [eligible[i:i + batch_size] for i in range(0, len(eligible), batch_size)]
     release["currentBatch"] = 0
     release["reports"] = {}
-    release["status"] = "in_progress" if release["batches"] else "completed"
+    at_instant = datetime.now(timezone.utc)
+    if release["batches"]:
+        release["status"] = "in_progress"
+        append_release_event(release, RELEASE_EVENT_STARTED, at_instant,
+                             phase_from="pending", phase_to="in_progress")
+    else:
+        # 空匹配：启动后直接 completed，started 之外补一条 finished（名义生命周期
+        # 与 batch timeline 一致：pending→in_progress、in_progress→completed）。
+        release["status"] = "completed"
+        append_release_event(release, RELEASE_EVENT_STARTED, at_instant,
+                             phase_from="pending", phase_to="in_progress")
+        append_release_event(release, RELEASE_EVENT_FINISHED, at_instant,
+                             phase_from="in_progress", phase_to="completed")
     return release_view(state, release)
 
 
@@ -489,7 +551,7 @@ def cmd_device_report(state, args):
     release_id = require_id(args.release_id, "release-id")
     device_id = require_id(args.device_id, "device-id")
     result = require_result(args.result)
-    heartbeat_at, _ = require_time(args.heartbeat_at)
+    heartbeat_at, at_instant = require_time(args.heartbeat_at)
     release = get_release(state, release_id)
     device = get_device(state, device_id)
     if release["status"] != "in_progress":
@@ -506,7 +568,13 @@ def cmd_device_report(state, args):
     device["heartbeatAt"] = heartbeat_at
     if result == "success":
         device["version"] = release["version"]
-    advance_if_batch_complete(state, release)
+    # 上报成功先记 reported（result 为 success/failure，reason 为 null，
+    # batchIndex 为当前批）；收批引发的推进/完成/停止回滚事件随后依序追加。
+    append_release_event(release, RELEASE_EVENT_REPORTED, at_instant,
+                         batch_index=release["currentBatch"], device_id=device_id,
+                         result=result)
+    # report 路径无显式 --at：收批引发的推进/完成/停止回滚事件时刻取本次心跳时刻。
+    advance_if_batch_complete(state, release, event_at=at_instant)
     view = release_view(state, release)
     view["report"] = {"deviceId": device_id, "result": result, "heartbeatAt": heartbeat_at}
     return view
@@ -538,6 +606,11 @@ def cmd_release_check(state, args):
                 "reason": "timeout",
                 "heartbeatAt": heartbeat_at,
             }
+            # 先逐台记 timeout_recorded（result=failure、reason=timeout），
+            # 再进入收批判定；批次按 device-id 升序，事件顺序确定。
+            append_release_event(release, RELEASE_EVENT_TIMEOUT_RECORDED, at_instant,
+                                 batch_index=release["currentBatch"], device_id=device_id,
+                                 result="failure", reason="timeout")
             expired.append(device_id)
     expired.sort()
     advance_if_batch_complete(state, release, at_instant=at_instant)
@@ -552,6 +625,8 @@ def cmd_release_pause(state, args):
     if release["status"] != "in_progress":
         raise InvalidState("release %s is not in progress (status: %s)" % (release_id, release["status"]))
     release["status"] = "paused"
+    append_release_event(release, RELEASE_EVENT_PAUSED, datetime.now(timezone.utc),
+                         phase_from="in_progress", phase_to="paused")
     return release_view(state, release)
 
 
@@ -561,6 +636,8 @@ def cmd_release_resume(state, args):
     if release["status"] != "paused":
         raise InvalidState("release %s is not paused (status: %s)" % (release_id, release["status"]))
     release["status"] = "in_progress"
+    append_release_event(release, RELEASE_EVENT_RESUMED, datetime.now(timezone.utc),
+                         phase_from="paused", phase_to="in_progress")
     return release_view(state, release)
 
 
@@ -573,14 +650,29 @@ def cmd_release_abort(state, args):
         raise InvalidState(
             "release %s cannot be aborted (status: %s)" % (release_id, release["status"])
         )
+    status_before = release["status"]
+    current = release["currentBatch"]
+    # 先记 aborted（result=failure、reason 为修剪后的人工原因），机械回滚后再记
+    # rolled_back（result=success、reason=manual_abort）；从 paused 止损时
+    # phaseFrom=paused。
+    append_release_event(release, RELEASE_EVENT_ABORTED, at_instant,
+                         batch_index=current, result="failure", reason=reason,
+                         phase_from=status_before, phase_to="rolled_back")
     roll_back(state, release, "manual_abort")
+    append_release_event(release, RELEASE_EVENT_ROLLED_BACK, at_instant,
+                         batch_index=current, result="success", reason="manual_abort",
+                         phase_from=status_before, phase_to="rolled_back")
     release["abortReason"] = reason
     release["abortedAt"] = format_instant(at_instant)
     return release_view(state, release)
 
 
 def roll_back(state, release, stop_reason):
-    """按既有口径回滚：恢复已纳入批次设备版本，记录停止原因并解除发布占用。"""
+    """按既有口径回滚：恢复已纳入批次设备版本，记录停止原因并解除发布占用。
+
+    仅做机械状态变更；审计事件（stopped/rolled_back 或 aborted/rolled_back）
+    由调用方按触发路径追加，保证阈值回滚与人工 abort 的事件口径各自明确。
+    """
     release["status"] = "rolled_back"
     release["stopReason"] = stop_reason
     release["stabilizationDeadline"] = None
@@ -591,7 +683,24 @@ def roll_back(state, release, stop_reason):
                 device["version"] = release["previousVersion"]
 
 
-def advance_if_batch_complete(state, release, at_instant=None):
+def stop_with_rollback(state, release, stop_reason, event_at):
+    """收批失败率超阈值：先记 stopped(failure)，回滚后再记 rolled_back(success)。
+
+    两条事件的 reason 均为具体阈值（batch_failure_threshold/
+    release_failure_threshold），occurredAt 统一取收批时刻（report 路径为
+    触发收批的心跳时刻，check 路径为 --at）。
+    """
+    current = release["currentBatch"]
+    append_release_event(release, RELEASE_EVENT_STOPPED, event_at,
+                         batch_index=current, result="failure", reason=stop_reason,
+                         phase_from="in_progress", phase_to="rolled_back")
+    roll_back(state, release, stop_reason)
+    append_release_event(release, RELEASE_EVENT_ROLLED_BACK, event_at,
+                         batch_index=current, result="success", reason=stop_reason,
+                         phase_from="in_progress", phase_to="rolled_back")
+
+
+def advance_if_batch_complete(state, release, at_instant=None, event_at=None):
     """整批集齐后决定回滚、观察或推进。
 
     先判当前批失败率，超阈值立即 rolled_back（stopReason=batch_failure_threshold）；
@@ -600,6 +709,10 @@ def advance_if_batch_complete(state, release, at_instant=None):
     保持 currentBatch，记录 stabilizationDeadline（当前批报告中最晚 heartbeatAt
     加观察秒数），仅在 at_instant 严格晚于截止时刻时推进下一批或 completed。
     at_instant 为 None（device report 路径）时只进入观察，不推进。
+
+    审计事件：阈值回滚追加 stopped+rolled_back；推进非末批追加 batch_advanced；
+    末批完成追加 finished。report 路径事件时刻取触发收批的心跳时刻（event_at），
+    check 路径取 --at（at_instant）；进入观察而不推进时不产生推进类事件。
     """
     batches = release["batches"]
     current = release["currentBatch"]
@@ -607,9 +720,11 @@ def advance_if_batch_complete(state, release, at_instant=None):
     reports = release["reports"]
     if any(device_id not in reports for device_id in batch):
         return
+    # 收批类事件的发生时刻：check 路径用 --at；report 路径用触发上报的心跳时刻。
+    transition_at = at_instant if at_instant is not None else event_at
     failed = sum(1 for device_id in batch if reports[device_id]["result"] == "failure")
     if failed * 100 > len(batch) * release["maxFailurePercent"]:
-        roll_back(state, release, "batch_failure_threshold")
+        stop_with_rollback(state, release, "batch_failure_threshold", transition_at)
         return
     max_release_percent = release.get("maxReleaseFailurePercent")
     if max_release_percent is not None:
@@ -618,7 +733,7 @@ def advance_if_batch_complete(state, release, at_instant=None):
             1 for report in reports.values() if report.get("result") == "failure"
         )
         if failed_count * 100 > reported_count * max_release_percent:
-            roll_back(state, release, "release_failure_threshold")
+            stop_with_rollback(state, release, "release_failure_threshold", transition_at)
             return
     stabilization = release.get("stabilizationSeconds", 0)
     if stabilization > 0:
@@ -628,18 +743,118 @@ def advance_if_batch_complete(state, release, at_instant=None):
             deadline_text = format_instant(latest + timedelta(seconds=stabilization))
             release["stabilizationDeadline"] = deadline_text
         if at_instant is None or at_instant <= parse_time(deadline_text):
+            # 进入或仍处于观察期：不推进也不记推进/完成事件。
             return
     release["stabilizationDeadline"] = None
     if current + 1 == len(batches):
         release["status"] = "completed"
+        append_release_event(release, RELEASE_EVENT_FINISHED, transition_at,
+                             batch_index=current, phase_from="in_progress",
+                             phase_to="completed")
     else:
         release["currentBatch"] = current + 1
+        append_release_event(release, RELEASE_EVENT_BATCH_ADVANCED, transition_at,
+                             batch_index=current + 1, phase_from="in_progress",
+                             phase_to="in_progress")
 
 
 def cmd_status(state, args):
     release_id = require_id(args.release_id, "release-id")
     release = get_release(state, release_id)
     return release_view(state, release)
+
+
+# ---------------------------------------------------------------------------
+# release 审计时间线只读查询
+# ---------------------------------------------------------------------------
+
+def require_release_after_sequence(value):
+    """--after-sequence：缺省 0；非负整数，否则 InvalidArgument。"""
+    if value is None:
+        return 0
+    try:
+        sequence = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise InvalidArgument(
+            "after-sequence must be a non-negative integer: %r" % (value,)
+        )
+    if sequence < 0:
+        raise InvalidArgument(
+            "after-sequence must be a non-negative integer: %r" % (value,)
+        )
+    return sequence
+
+
+def require_release_timeline_limit(value):
+    """--limit：缺省 200；1 到 1000 的整数，否则 InvalidArgument。"""
+    if value is None:
+        return RELEASE_TIMELINE_DEFAULT_LIMIT
+    try:
+        limit = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise InvalidArgument(
+            "limit must be an integer between 1 and %d: %r"
+            % (RELEASE_TIMELINE_MAX_LIMIT, value)
+        )
+    if limit < 1 or limit > RELEASE_TIMELINE_MAX_LIMIT:
+        raise InvalidArgument(
+            "limit must be an integer between 1 and %d: %r"
+            % (RELEASE_TIMELINE_MAX_LIMIT, value)
+        )
+    return limit
+
+
+def release_timeline_event_view(event):
+    """按固定字段顺序输出一条事件；沿用 batch timeline 的九字段，缺字段补 None。"""
+    return {
+        "sequence": event.get("sequence"),
+        "type": event.get("type"),
+        "occurredAt": event.get("occurredAt"),
+        "batchIndex": event.get("batchIndex"),
+        "deviceId": event.get("deviceId"),
+        "result": event.get("result"),
+        "phaseFrom": event.get("phaseFrom"),
+        "phaseTo": event.get("phaseTo"),
+        "reason": event.get("reason"),
+    }
+
+
+def cmd_release_timeline(state, args):
+    """只读时间线：发布不存在 DeviceNotFound；参数非法 InvalidArgument；不落盘。
+
+    旧状态缺 timeline（events 非列表）时不回填：events=[]、nextSequence=1，
+    后续成功写命令从 1 起追加。状态或事件结构不明（events 存在但非列表、
+    事件非对象或 sequence 非整数）返回 InvalidState。
+    """
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    after_sequence = require_release_after_sequence(args.after_sequence)
+    limit = require_release_timeline_limit(args.limit)
+
+    if "events" not in release:
+        # 旧状态无时间线：不回填、不视为损坏。
+        events = []
+    else:
+        events = release["events"]
+        if not isinstance(events, list):
+            raise InvalidState("release %s timeline is corrupted" % release_id)
+        for event in events:
+            if not isinstance(event, dict) \
+                    or not isinstance(event.get("sequence"), int) \
+                    or isinstance(event.get("sequence"), bool):
+                raise InvalidState("release %s timeline is corrupted" % release_id)
+
+    sequences = [event["sequence"] for event in events]
+    next_sequence = max(sequences) + 1 if sequences else 1
+    selected = sorted(
+        (event for event in events if event["sequence"] > after_sequence),
+        key=lambda event: event["sequence"],
+    )
+    return {
+        "releaseId": release["releaseId"],
+        "nextSequence": next_sequence,
+        "events": [release_timeline_event_view(event) for event in selected[:limit]],
+    }
 
 
 def fleet_device_row(device_id, device, at_instant, stale_boundary):
@@ -986,6 +1201,16 @@ def build_parser():
     release_abort.add_argument("--at", required=True, help="终止时刻（ISO 8601）")
     release_abort.set_defaults(handler=cmd_release_abort, mutating=True)
     add_state_option(release_abort)
+
+    release_timeline = release_sub.add_parser(
+        "timeline", help="查询发布审计时间线（只读）")
+    release_timeline.add_argument("--release-id", required=True)
+    release_timeline.add_argument("--after-sequence", default=None,
+                                  help="只返回 sequence 严格大于该值的事件，非负整数（默认 0）")
+    release_timeline.add_argument("--limit", default=None,
+                                  help="返回最早的事件条数，1 到 1000 的整数（默认 200）")
+    release_timeline.set_defaults(handler=cmd_release_timeline, mutating=False)
+    add_state_option(release_timeline)
 
     status = subparsers.add_parser("status", help="查看发布状态")
     status.add_argument("--release-id", required=True)

@@ -49,6 +49,10 @@ python -m ota_canary release abort --release-id R1 \
 # 查看发布状态
 python -m ota_canary status --release-id R1
 
+# 只读查询发布审计时间线（分页）
+python -m ota_canary release timeline --release-id R1 \
+    [--after-sequence 0] [--limit 200]
+
 # 只读查看设备心跳与版本状态（全部设备 / 仅某发布批次）
 python -m ota_canary fleet status \
     [--release-id R1] [--at 2026-10-01T10:00:00Z] [--heartbeat-timeout-seconds 900]
@@ -241,6 +245,44 @@ python -m ota_canary fleet rollout-status [--at 2026-10-01T10:00:00Z]
   `rolled_back` 发布执行返回 `InvalidState`。发布视图含 `abortReason` 与
   `abortedAt`，旧状态缺少这两个字段时显示 `null`，不补写历史；`manual_abort`
   不改变 `batch_failure_threshold` 与 `release_failure_threshold` 的既有口径。
+- `release timeline --release-id <id> [--after-sequence N] [--limit M]` 是发布的
+  只读审计时间线，字段结构、UTC `Z` 时刻口径与 `batch timeline` 完全一致（独立存储，
+  互不影响）。输出固定为 `releaseId`、`nextSequence`、`events`：`events` 按
+  `sequence` 升序，且仅含严格大于 `--after-sequence`（缺省 0，须为非负整数）的事件，
+  取最早的 `--limit` 条（缺省 200，须为 1 到 1000 的整数）；`nextSequence` 为下一
+  条事件序号（无事件为 1，否则为最大 `sequence` 加 1），与分页参数无关。每条事件
+  字段为 `sequence`（从 1 起严格递增）、`type`、`occurredAt`、`batchIndex`、
+  `deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason`，未涉及字段为 `null`。
+  事件类型与取值：
+  - `create` 成功记 `created`；`start` 记 `started`，空匹配直接完成时再补一条
+    `finished`（同一时刻）。
+  - `device report` 成功记 `reported`（`batchIndex` 为当前批、`deviceId` 为上报
+    设备，`result` 为 `success`/`failure`，`reason` 为 `null`）。
+  - `release check` 先对本次每台超时设备记 `timeout_recorded`
+    （`result=failure`、`reason=timeout`、`deviceId` 为该设备），再做收批判定。
+  - 收批（由 report 触发或 check 越过观察期）后：推进非末批记 `batch_advanced`
+    （`batchIndex` 为新批次号）；末批完成记 `finished`；逐批失败率超阈值记
+    `stopped` 后回滚再记 `rolled_back`，发布级累计失败率超阈值同理，
+    `reason` 分别为 `batch_failure_threshold` / `release_failure_threshold`。
+  - `pause`/`resume` 成功记 `paused`/`resumed`（`phaseFrom`/`phaseTo` 为
+    `in_progress→paused`、`paused→in_progress`）；`abort` 先记 `aborted`
+    （`result=failure`、`reason` 为修剪后的人工 `--reason`，从 `paused` 止损时
+    `phaseFrom=paused`），回滚后再记 `rolled_back`（`result=success`、
+    `reason=manual_abort`）。
+  - `result`/`reason` 汇总：`reported` 为 `(success|failure, null)`，
+    `timeout_recorded` 为 `(failure, timeout)`，`stopped` 为
+    `(failure, batch_failure_threshold|release_failure_threshold)`，`aborted` 为
+    `(failure, 人工原因)`，`rolled_back` 为 `(success, 阈值|manual_abort)`，
+    其余事件为 `(null, null)`。
+  - `occurredAt` 取显式 `--at`（check/abort）、上报的 `heartbeatAt`（report 触发的
+    收批事件同取该心跳时刻）或调用时刻（create/start/pause/resume）。
+  - 仅状态变化成功时追加：命令失败、只读命令、幂等重复、迟到/冲突上报均不追加，
+    历史事件只增不改。观察期内未越过截止时刻且未补出超时的 `check` 不产生事件。
+  - 发布不存在返回 `DeviceNotFound`；`--after-sequence` 不是非负整数、`--limit`
+    不在 1 到 1000 返回 `InvalidArgument`；状态或时间线结构语义不明（`events`
+    存在但非列表、事件非对象或 `sequence` 非整数）返回 `InvalidState`。错误均走
+    stderr JSON、非零退出且不改状态。查询无副作用；旧状态缺时间线时输出
+    `events=[]`、`nextSequence=1`，不回填，后续成功写命令从 1 起追加。
 - 已超时设备或非当前批设备的迟到 `device report` 返回 `InvalidArgument`。
 - 成功的写命令输出 JSON 并持久化状态；`status` 与 `release plan` 为只读，不产生业务变化。
 - 失败命令以非零退出码结束，向 stderr 输出 JSON 错误，且不修改状态文件。
