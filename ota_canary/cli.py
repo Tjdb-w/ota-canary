@@ -923,6 +923,122 @@ def cmd_release_timeline(state, args):
     }
 
 
+# ---------------------------------------------------------------------------
+# 设备时间线只读查询（跨 release 与 batch rollout 归集设备相关事件）
+# ---------------------------------------------------------------------------
+
+def require_device_timeline_offset(value):
+    """--offset：缺省 0；非负整数，否则 InvalidArgument。"""
+    if value is None:
+        return 0
+    try:
+        offset = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise InvalidArgument("offset must be a non-negative integer: %r" % (value,))
+    if offset < 0:
+        raise InvalidArgument("offset must be a non-negative integer: %r" % (value,))
+    return offset
+
+
+def device_timeline_events(entry, ref, source_type, source_id, device_id):
+    """只读归集一个 release/batch 审计时间线中属于指定设备的原事件。
+
+    缺 events 键按空集读取、不回填；events 非列表、事件非对象或 sequence 非整数
+    均为时间线结构损坏（InvalidState）。deviceId 不匹配的事件（含总体事件）
+    不入选；不为设备虚构心跳事件。
+    """
+    if not isinstance(entry, dict):
+        raise InvalidState("%s is corrupted" % ref)
+    if "events" not in entry:
+        return []
+    events = entry["events"]
+    if not isinstance(events, list):
+        raise InvalidState("%s timeline is corrupted" % ref)
+    matched = []
+    for event in events:
+        if not isinstance(event, dict) \
+                or not isinstance(event.get("sequence"), int) \
+                or isinstance(event.get("sequence"), bool):
+            raise InvalidState("%s timeline is corrupted" % ref)
+        if event.get("deviceId") != device_id:
+            continue
+        matched.append({
+            "sourceType": source_type,
+            "sourceId": source_id,
+            "sourceSequence": event.get("sequence"),
+            "type": event.get("type"),
+            "occurredAt": event.get("occurredAt"),
+            "batchIndex": event.get("batchIndex"),
+            "result": event.get("result"),
+            "phaseFrom": event.get("phaseFrom"),
+            "phaseTo": event.get("phaseTo"),
+            "reason": event.get("reason"),
+        })
+    return matched
+
+
+def device_timeline_sort_key(event):
+    """occurredAt 升序，release 先于 batch，再按 sourceId 码点与 sourceSequence。"""
+    occurred_at = event["occurredAt"]
+    return (
+        occurred_at if isinstance(occurred_at, str) else "",
+        0 if event["sourceType"] == "release" else 1,
+        event["sourceId"],
+        event["sourceSequence"],
+    )
+
+
+def cmd_device_timeline(state, args):
+    """只读设备时间线：不写审计、不改状态、不落盘，重复调用结果稳定。
+
+    设备不存在 DeviceNotFound；offset/limit 非法 InvalidArgument；状态整体非
+    对象或任一 release/batch 时间线结构损坏 InvalidState。无匹配事件时
+    events 为空、total 为 0、nextOffset 为 null。
+    """
+    device_id = require_id(args.device_id, "device-id")
+    offset = require_device_timeline_offset(args.offset)
+    limit = require_release_timeline_limit(args.limit)
+
+    devices = state.get("devices")
+    releases = state.get("releases")
+    rollouts = state.get("batchRollouts", {})
+    if not isinstance(devices, dict) or not isinstance(releases, dict) \
+            or not isinstance(rollouts, dict):
+        raise InvalidState("state file is corrupted")
+    device = devices.get(device_id)
+    if device is None:
+        raise DeviceNotFound("device not found: %s" % device_id)
+    if not isinstance(device, dict):
+        raise InvalidState("device record is corrupted: %s" % device_id)
+
+    matched = []
+    for release_id, release in releases.items():
+        matched.extend(device_timeline_events(
+            release, "release %s" % release_id, "release", release_id, device_id))
+    for batch_id, rollout in rollouts.items():
+        matched.extend(device_timeline_events(
+            rollout, "batch %s" % batch_id, "batch", batch_id, device_id))
+    matched.sort(key=device_timeline_sort_key)
+
+    total = len(matched)
+    page = matched[offset:offset + limit]
+    next_offset = offset + len(page)
+    if next_offset >= total:
+        next_offset = None
+    return {
+        "device": {
+            "deviceId": device_id,
+            "version": device.get("version"),
+            "heartbeatAt": device.get("heartbeatAt"),
+        },
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "nextOffset": next_offset,
+        "events": page,
+    }
+
+
 def fleet_device_row(device_id, device, at_instant, stale_boundary):
     """构造单设备的 fleet status 行；心跳时间已由调用方校验为 UTC 瞬间或 None。"""
     heartbeat_text = device.get("heartbeatAt")
@@ -1213,6 +1329,16 @@ def build_parser():
     device_report.add_argument("--heartbeat-at", required=True)
     device_report.set_defaults(handler=cmd_device_report, mutating=True)
     add_state_option(device_report)
+
+    device_timeline = device_sub.add_parser(
+        "timeline", help="查询设备跨 release 与 batch rollout 的升级时间线（只读）")
+    device_timeline.add_argument("--device-id", required=True)
+    device_timeline.add_argument("--offset", default=None,
+                                 help="跳过的事件条数，非负整数（默认 0）")
+    device_timeline.add_argument("--limit", default=None,
+                                 help="返回最多的事件条数，1 到 1000 的整数（默认 200）")
+    device_timeline.set_defaults(handler=cmd_device_timeline, mutating=False)
+    add_state_option(device_timeline)
 
     release = subparsers.add_parser("release", help="发布创建与启动")
     release_sub = release.add_subparsers(dest="release_command")
