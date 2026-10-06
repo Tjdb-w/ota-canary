@@ -32,6 +32,7 @@ RELEASE_EVENT_RESUMED = "resumed"
 RELEASE_EVENT_STOPPED = "stopped"
 RELEASE_EVENT_ROLLED_BACK = "rolled_back"
 RELEASE_EVENT_ABORTED = "aborted"
+RELEASE_EVENT_POLICY_UPDATED = "policy_updated"
 
 # release timeline 查询的默认与上限
 RELEASE_TIMELINE_DEFAULT_LIMIT = 200
@@ -545,6 +546,75 @@ def cmd_release_plan(state, args):
         "candidateCount": len(eligible),
         "batches": batches,
     }
+
+
+def require_update_target_device_ids(values):
+    """release update 的显式目标集合：修剪后为空或重复返回 InvalidArgument；升序返回。"""
+    seen = set()
+    target_ids = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidArgument("target-device-id must be a non-empty string: %r" % (value,))
+        device_id = value.strip()
+        if device_id in seen:
+            raise InvalidArgument("duplicate target-device-id: %s" % device_id)
+        seen.add(device_id)
+        target_ids.append(device_id)
+    return sorted(target_ids)
+
+
+def cmd_release_update(state, args):
+    """调整 pending 发布的批次策略：batch-size 与定向设备集合。
+
+    仅 pending 可更新；省略项保持原值。显式 --target-device-id 整体替换原定向
+    集合（按 device-id 升序落盘），--clear-target-device-ids 恢复为不限定
+    （全量选择，落盘为 null），二者不得混用。版本与占用问题仍由 plan/start
+    判定，此处不预检。全部校验通过后才一次写入：保持 pending，不建批次、
+    不改报告、设备版本、心跳或占用，按调用时刻追加 policy_updated 审计事件，
+    返回 status 同结构视图。旧状态缺 targetDeviceIds 按不限定处理，更新只写
+    本次列表或 null，不回填历史字段。
+    """
+    release_id = require_id(args.release_id, "release-id")
+    release = get_release(state, release_id)
+    if release["status"] != "pending":
+        raise InvalidState(
+            "release %s cannot be updated (status: %s)" % (release_id, release["status"])
+        )
+
+    target_values = getattr(args, "target_device_id", None)
+    clear_targets = bool(getattr(args, "clear_target_device_ids", False))
+
+    # 显式目标语法校验：修剪后为空或重复 InvalidArgument。
+    new_targets = None
+    if target_values is not None:
+        new_targets = require_update_target_device_ids(target_values)
+    if new_targets is not None and clear_targets:
+        raise InvalidArgument(
+            "target-device-id and clear-target-device-ids cannot be used together"
+        )
+    # 未提供任何调整项（batch-size/显式目标/清空）时拒绝。
+    if new_targets is None and not clear_targets and args.batch_size is None:
+        raise InvalidArgument("release update requires at least one change")
+
+    batch_size = None
+    if args.batch_size is not None:
+        batch_size = require_batch_size(args.batch_size)
+
+    # 显式目标每台设备都必须已登记（DeviceNotFound）；版本与占用留给 plan/start。
+    if new_targets is not None:
+        for device_id in new_targets:
+            get_device(state, device_id)
+
+    # 全部校验通过，一次写入：保持 pending，不建批次、不改报告或设备状态。
+    if batch_size is not None:
+        release["batchSize"] = batch_size
+    if new_targets is not None:
+        release["targetDeviceIds"] = new_targets
+    elif clear_targets:
+        release["targetDeviceIds"] = None
+    append_release_event(release, RELEASE_EVENT_POLICY_UPDATED,
+                         datetime.now(timezone.utc))
+    return release_view(state, release)
 
 
 def cmd_device_report(state, args):
@@ -1193,6 +1263,23 @@ def build_parser():
     release_plan.add_argument("--release-id", required=True)
     release_plan.set_defaults(handler=cmd_release_plan, mutating=False)
     add_state_option(release_plan)
+
+    release_update = release_sub.add_parser(
+        "update", help="调整 pending 发布的批次大小与定向设备集合（仅 pending）")
+    release_update.add_argument("--release-id", required=True)
+    release_update.add_argument("--batch-size", default=None,
+                                help="新的每批设备数量，正整数；缺省保持原值")
+    release_update.add_argument("--target-device-id", action="append",
+                                default=argparse.SUPPRESS,
+                                help="显式目标设备，可重复；整体替换原定向集合，"
+                                     "按 device-id 升序落盘；不得与 "
+                                     "--clear-target-device-ids 混用")
+    release_update.add_argument("--clear-target-device-ids", action="store_true",
+                                default=False,
+                                help="清除定向集合，恢复为不限定（全量选择）；"
+                                     "不得与 --target-device-id 混用")
+    release_update.set_defaults(handler=cmd_release_update, mutating=True)
+    add_state_option(release_update)
 
     release_check = release_sub.add_parser("check", help="按给定时刻收批心跳超时设备")
     release_check.add_argument("--release-id", required=True)

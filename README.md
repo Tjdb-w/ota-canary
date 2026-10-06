@@ -31,6 +31,11 @@ python -m ota_canary release start --release-id R1
 # 只读预览 pending 发布的分批计划（不创建批次、reports，不改变任何状态）
 python -m ota_canary release plan --release-id R1
 
+# 放量前调整 pending 发布的批次大小与定向设备集合（仅 pending）
+python -m ota_canary release update --release-id R1 \
+    [--batch-size 3] \
+    [--target-device-id d1 --target-device-id d2 | --clear-target-device-ids]
+
 # 当前批设备上报结果
 python -m ota_canary device report --release-id R1 --device-id d1 \
     --result success --heartbeat-at 2026-10-01T10:00:00Z
@@ -104,6 +109,20 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
   `eligibleDeviceIds` 与 `batches` 均为空。发布不存在返回 `DeviceNotFound`；对非
   `pending` 发布执行返回 `InvalidState`。错误走 stderr JSON 且退出码非零；`status`
   保持现有输出，旧状态缺少 `targetDeviceIds` 时该字段为 `null`（视为未指定）。
+- `release update --release-id <id>` 仅对 `pending` 发布生效，用于放量前调整排批策略：
+  可选 `--batch-size`（正整数）替换每批数量；可重复的 `--target-device-id` 以去重后的
+  完整集合整体替换原定向集合（按 device-id 升序落盘）；`--clear-target-device-ids`
+  恢复为不限定（全量选择，`targetDeviceIds` 落盘为 `null`）。省略项保持原值；显式目标
+  与清空不得混用。`--batch-size` 非正整数、任一 `--target-device-id` 修剪后为空、
+  device-id 重复、显式目标与清空混用，或未提供任何调整项，均返回 `InvalidArgument`；
+  显式目标任一未登记返回 `DeviceNotFound`；发布不存在返回 `DeviceNotFound`，非
+  `pending` 返回 `InvalidState`。版本匹配与跨子系统占用仍由 `release plan`/`release
+  start` 判定，`update` 不预检。全部校验通过后才一次写入：保持 `pending`，不建批次、
+  不改报告、设备版本、心跳或占用，失败不修改状态文件；成功按调用时刻向 release
+  timeline 追加 `policy_updated` 事件（`batchIndex`/`deviceId`/`result`/`phaseFrom`/
+  `phaseTo`/`reason` 均为 `null`），并返回与 `status` 同结构的视图。旧状态缺少
+  `targetDeviceIds` 时按不限定处理，更新只写本次列表或 `null`，不回填历史字段；
+  后续 `release plan`/`release start` 即按新策略排批。
 - `release create` 可选、可重复的 `--target-device-id` 用于定向灰度：显式指定后，本次
   发布只升级给定设备，`release start` 不再自动吸收全部符合版本条件的设备。该参数可放在
   子命令前后并混用，多次出现按出现顺序合并。取值修剪后为空返回 `InvalidArgument`；
