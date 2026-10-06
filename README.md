@@ -31,6 +31,10 @@ python -m ota_canary release start --release-id R1
 # 只读预览 pending 发布的分批计划（不创建批次、reports，不改变任何状态）
 python -m ota_canary release plan --release-id R1
 
+# 放量前调整 pending 发布的批次大小与定向目标（不建批次、保持 pending）
+python -m ota_canary release update --release-id R1 [--batch-size 3] \
+    [--target-device-id d1 --target-device-id d2 | --clear-target-device-ids]
+
 # 当前批设备上报结果
 python -m ota_canary device report --release-id R1 --device-id d1 \
     --result success --heartbeat-at 2026-10-01T10:00:00Z
@@ -104,6 +108,30 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
   `eligibleDeviceIds` 与 `batches` 均为空。发布不存在返回 `DeviceNotFound`；对非
   `pending` 发布执行返回 `InvalidState`。错误走 stderr JSON 且退出码非零；`status`
   保持现有输出，旧状态缺少 `targetDeviceIds` 时该字段为 `null`（视为未指定）。
+- `release update --release-id <id>` 在放量前调整 pending 发布的批次大小与定向目标，
+  让后续 `release plan`/`release start` 按最新设备清单重排批次：可选 `--batch-size`
+  （正整数，省略保留原值）、可重复的 `--target-device-id`（传入任一即以本次集合
+  **整体替换**原目标，按 device-id 升序）与 `--clear-target-device-ids`（恢复为
+  不限定，`targetDeviceIds` 写为 `null` 并全量选择）。`--target-device-id` 可放在
+  子命令前后并混用，多次出现按出现顺序合并。显式目标与清空选项不得混用；没有任何
+  调整项（三者均未提供）返回 `InvalidArgument`。`--batch-size` 非正整数、任一
+  `--target-device-id` 修剪后为空、同一 device-id 重复（即使分散在子命令前后）均
+  返回 `InvalidArgument`；显式目标任一设备未登记返回 `DeviceNotFound`。发布不存在
+  返回 `DeviceNotFound`；对非 `pending` 发布执行返回 `InvalidState`。本命令只判
+  设备存在性，不判版本与跨子系统占用——版本不等于 `previousVersion`、设备被占用等
+  仍由 `release plan`/`release start` 按既有口径处理。全部校验通过后才一次原子
+  写入：保持 `pending`，不建批次、不写 reports，不改设备版本、心跳、占用；失败
+  命令不改变批次、报告、设备版本、心跳、占用或状态文件。成功返回与
+  `status --release-id` 完全同结构的视图：pending 发布的 `batches` 为 `[]`、
+  `devices` 为 `[]`、`reports` 为空（`reportedCount`/`failedCount` 为 0），
+  `targetDeviceIds` 显式目标按 device-id 升序、清空后为 `null`，`batchSize` 为
+  有效值（省略即原值）。成功后向 release timeline 追加一条 `policy_updated`
+  事件：`occurredAt` 取调用时刻（UTC `Z`），`batchIndex`、`deviceId`、`result`、
+  `phaseFrom`、`phaseTo`、`reason` 均为 `null`；失败不追加事件，沿用只增、严格
+  递增与分页规则。旧状态缺少 `targetDeviceIds` 仍按不限定处理；update 成功只写
+  本次给定的列表或 `null`，不回填历史字段；`release plan` 保持只读稳定，`status`
+  兼容展示不变。既有 release、device、fleet、batch rollout 行为均不变，`--state`
+  在子命令前后均可用。
 - `release create` 可选、可重复的 `--target-device-id` 用于定向灰度：显式指定后，本次
   发布只升级给定设备，`release start` 不再自动吸收全部符合版本条件的设备。该参数可放在
   子命令前后并混用，多次出现按出现顺序合并。取值修剪后为空返回 `InvalidArgument`；
@@ -275,6 +303,9 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
   事件类型与取值：
   - `create` 成功记 `created`；`start` 记 `started`，空匹配直接完成时再补一条
     `finished`（同一时刻）。
+  - `release update` 成功记 `policy_updated`（`occurredAt` 取调用时刻；
+    `batchIndex`、`deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason` 均为
+    `null`）；更新失败不追加。
   - `device report` 成功记 `reported`（`batchIndex` 为当前批、`deviceId` 为上报
     设备，`result` 为 `success`/`failure`，`reason` 为 `null`）。
   - `release check` 先对本次每台超时设备记 `timeout_recorded`
@@ -294,7 +325,7 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
     `(failure, 人工原因)`，`rolled_back` 为 `(success, 阈值|manual_abort)`，
     其余事件为 `(null, null)`。
   - `occurredAt` 取显式 `--at`（check/abort）、上报的 `heartbeatAt`（report 触发的
-    收批事件同取该心跳时刻）或调用时刻（create/start/pause/resume）。
+    收批事件同取该心跳时刻）或调用时刻（create/update/start/pause/resume）。
   - 仅状态变化成功时追加：命令失败、只读命令、幂等重复、迟到/冲突上报均不追加，
     历史事件只增不改。观察期内未越过截止时刻且未补出超时的 `check` 不产生事件。
   - 发布不存在返回 `DeviceNotFound`；`--after-sequence` 不是非负整数、`--limit`
