@@ -57,8 +57,19 @@
   全部校验通过后才一次写入，保持 pending、不建批次、不改设备或占用，按
   --at 追加 policy_updated 审计事件；后续 batch plan/start 即按新集合与
   策略计算资格、金丝雀优先与分批。
+- 人工放行门禁：``batch create --approval-required`` 开启（``batch update`` 可在
+  pending 阶段用 --approval-required/--no-approval-required 切换，两开关同现
+  InvalidArgument，缺省保留原策略）。开启后 batch start 仍开始第一批；当前批
+  集齐终态且未越失败阈值、沿用 stabilization-seconds 与 batch check --at 的
+  观察规则到达可推进边界且仍有下一批时，不直接推进：批次保持 in_progress 并
+  进入 awaitingApproval 等待（追加 approval_requested 事件，batchIndex 为下一
+  批次号），尚未开始设备保持冻结；``batch approve --batch-id --at`` 仅在该状态
+  生效，记录放行（approvedBatchIndexes 追加下一批次号、lastApprovedAt）并打开
+  下一批（追加 approval_granted），末批无下一批可等待、直接 completed。等待
+  期间 check 不推进，pause 后不能批准，resume 回到等待，abort 按既有规则冻结
+  并回滚，迟到或冲突上报不能绕过门禁。
 - 审计时间线：create/update/start/report/check/abort/rollback-report/pause/resume/
-  rollback-retry 成功后
+  rollback-retry/approve 成功后
   向批次追加严格递增事件（失败、幂等重复、冲突/迟到不追加，历史只增不改），
   ``batch timeline`` 只读查询，支持 --after-sequence 与 --limit 分页。
 
@@ -151,6 +162,8 @@ EVENT_FINISHED = "finished"
 EVENT_ROLLBACK_TIMED_OUT = "rollback_timed_out"
 EVENT_ROLLBACK_RETRY_STARTED = "rollback_retry_started"
 EVENT_POLICY_UPDATED = "policy_updated"
+EVENT_APPROVAL_REQUESTED = "approval_requested"
+EVENT_APPROVAL_GRANTED = "approval_granted"
 
 # 回滚收束时限缺省秒数（旧状态缺 rollbackTimeoutSeconds 时按此解释）
 DEFAULT_ROLLBACK_TIMEOUT_SECONDS = 900
@@ -436,6 +449,9 @@ def cmd_batch_create(state, args):
         getattr(args, "canary_device_id", None), device_ids, batch_size
     )
 
+    # 人工放行门禁：--approval-required 开启；缺省不开启（旧状态缺字段按未开启）。
+    approval_required = bool(getattr(args, "approval_required", False))
+
     # 其余沿用既有入口约定：设备必须存在（金丝雀是目标子集，一并覆盖）；
     # 显式目标不得包含隔离设备（InvalidArgument）。
     for device_id in device_ids:
@@ -456,6 +472,10 @@ def cmd_batch_create(state, args):
         "rollbackDeadline": None,
         "targetDeviceIds": device_ids,
         "canaryDeviceIds": canary_ids,
+        "approvalRequired": approval_required,
+        "awaitingApproval": False,
+        "approvedBatchIndexes": [],
+        "lastApprovedAt": None,
         "status": STATUS_PENDING,
         "frozen": False,
         "stopReason": None,
@@ -535,7 +555,16 @@ def cmd_batch_update(state, args):
             "canary-device-id and clear-canary-device-ids cannot be used together"
         )
 
-    # 未提供任何修改项（目标/金丝雀/清空/策略）时拒绝。
+    # 人工放行门禁开关：--approval-required 开启、--no-approval-required 关闭；
+    # 两开关同现 InvalidArgument，均未提供时保留原策略（旧状态缺字段按未开启）。
+    set_approval = bool(getattr(args, "approval_required", False))
+    clear_approval = bool(getattr(args, "no_approval_required", False))
+    if set_approval and clear_approval:
+        raise cli.InvalidArgument(
+            "approval-required and no-approval-required cannot be used together"
+        )
+
+    # 未提供任何修改项（目标/金丝雀/清空/策略/门禁开关）时拒绝。
     policy_given = any((
         args.batch_size is not None,
         args.failure_threshold is not None,
@@ -544,7 +573,7 @@ def cmd_batch_update(state, args):
         args.rollback_timeout_seconds is not None,
     ))
     if new_targets is None and new_canary is None and not clear_canary \
-            and not policy_given:
+            and not policy_given and not (set_approval or clear_approval):
         raise cli.InvalidArgument("batch update requires at least one change")
 
     # 策略参数：未提供保留原值；提供时沿用 batch create 的取值范围，
@@ -572,6 +601,12 @@ def cmd_batch_update(state, args):
         )
     else:
         rollback_timeout = require_rollback_timeout(args.rollback_timeout_seconds)
+    if set_approval:
+        approval_required = True
+    elif clear_approval:
+        approval_required = False
+    else:
+        approval_required = bool(rollout.get("approvalRequired", False))
 
     # 目标替换：去重后的完整集合整体替换；每台设备必须已登记（DeviceNotFound）
     # 且未隔离（InvalidArgument）。未替换目标时不校验隔离（隔离时已纳入的
@@ -624,6 +659,7 @@ def cmd_batch_update(state, args):
     rollout["heartbeatTimeoutSeconds"] = heartbeat_timeout
     rollout["stabilizationSeconds"] = stabilization_seconds
     rollout["rollbackTimeoutSeconds"] = rollback_timeout
+    rollout["approvalRequired"] = approval_required
     append_event(rollout, EVENT_POLICY_UPDATED, at_instant)
     return batch_view(state, rollout, at_instant=at_instant)
 
@@ -718,6 +754,9 @@ def cmd_batch_plan(state, args):
         "batchSize": rollout["batchSize"],
         "targetDeviceIds": target_ids,
         "canaryDeviceIds": list(rollout.get("canaryDeviceIds") or []),
+        # 人工放行门禁与等待状态：旧状态缺字段时按未开启、不等待显示。
+        "approvalRequired": bool(rollout.get("approvalRequired", False)),
+        "awaitingApproval": bool(rollout.get("awaitingApproval", False)),
         "eligibleDeviceIds": eligible_ids,
         "ineligibleDevices": ineligible,
         "candidateCount": len(eligible_ids),
@@ -1050,6 +1089,10 @@ def finalize_batch_if_ready(state, rollout, at_instant):
     entries = rollout["devices"]
     if any(entries[d]["terminal"] is None for d in group):
         return
+    # 人工放行门禁等待中：批次保持 in_progress，report/check/resume 均不推进、
+    # 不重开观察窗口、不重复追加事件；仅 batch approve 放行下一批。
+    if rollout.get("awaitingApproval"):
+        return
     failed = sum(1 for d in group if entries[d]["terminal"]["result"] == "failure")
     rate = Fraction(failed, len(group))
     threshold = Fraction(Decimal(rollout["failureThreshold"]))
@@ -1141,7 +1184,13 @@ def advance_stabilized_batch_if_due(rollout, at_instant):
 
 
 def advance_or_finish_batch(rollout, at_instant):
-    """推进下一批（batch_opened 已在 start 记录，此处记 batch_advanced）或完成。"""
+    """推进下一批（batch_opened 已在 start 记录，此处记 batch_advanced）或完成。
+
+    开启人工放行门禁（approvalRequired）且仍有下一批时，到达可推进边界不直接
+    推进：批次保持 in_progress，进入 awaitingApproval 等待并冻结尚未开始的
+    设备，追加 approval_requested 事件（batchIndex 为下一批次号），由
+    batch approve 放行；末批无下一批可等待，直接 completed。
+    """
     current = rollout["currentBatch"]
     rollout["stabilizationDeadline"] = None
     if current + 1 == len(rollout["batches"]):
@@ -1151,6 +1200,10 @@ def advance_or_finish_batch(rollout, at_instant):
         append_event(rollout, EVENT_FINISHED, at_instant,
                      phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_COMPLETED)
         mark_status_changed(rollout, at_instant)
+    elif rollout.get("approvalRequired"):
+        rollout["awaitingApproval"] = True
+        append_event(rollout, EVENT_APPROVAL_REQUESTED, at_instant,
+                     batch_index=current + 1)
     else:
         promote_batch(rollout, current + 1, at_instant)
         append_event(rollout, EVENT_BATCH_ADVANCED, at_instant, batch_index=current + 1)
@@ -1167,8 +1220,10 @@ def freeze_and_dispatch_rollbacks(rollout, stop_reason, at_instant):
     rollout["stopReason"] = stop_reason
     rollout["currentBatchStartedAt"] = None
     mark_status_changed(rollout, at_instant)
-    # 冻结即退出观察期：清空观察截止时刻（自动阈值停止与人工 abort 共用本路径）。
+    # 冻结即退出观察期：清空观察截止时刻（自动阈值停止与人工 abort 共用本路径）；
+    # 同时退出人工放行等待（若正处于 awaitingApproval）。
     rollout["stabilizationDeadline"] = None
+    rollout["awaitingApproval"] = False
     ordered = sorted(rollout["devices"].items(),
                      key=lambda kv: (kv[1]["batchIndex"], kv[0]))
     dispatched = False
@@ -1288,6 +1343,34 @@ def cmd_batch_resume(state, args):
     view = batch_view(state, rollout, at_instant=at_instant)
     view["effective"] = True
     return view
+
+
+def cmd_batch_approve(state, args):
+    """人工放行：仅 awaitingApproval 的进行中批次可批准，打开下一批。
+
+    记录放行（approvedBatchIndexes 追加下一批次号、lastApprovedAt 记为 --at
+    换算 UTC 后的 Z 时刻），清空等待标记，把下一批合格未隔离设备置为
+    pending_upgrade，并追加 approval_granted 事件（batchIndex 为下一批次号）；
+    批次、设备、状态与事件一次原子更新，不改变升级、超时、回滚和占用结果。
+    批次不存在 DeviceNotFound；--at 非法 InvalidArgument；非等待放行状态
+    （含已暂停、未开启门禁、末批已完成等）InvalidState。失败与重复动作不写
+    状态、不追加事件。
+    """
+    batch_id = cli.require_id(args.batch_id, "batch-id")
+    _, at_instant = cli.require_time(args.at)
+    rollout = get_rollout(state, batch_id)
+    if rollout["status"] != STATUS_IN_PROGRESS or not rollout.get("awaitingApproval"):
+        raise cli.InvalidState(
+            "batch %s is not awaiting approval (status: %s)"
+            % (batch_id, rollout["status"])
+        )
+    next_index = rollout["currentBatch"] + 1
+    rollout["awaitingApproval"] = False
+    rollout.setdefault("approvedBatchIndexes", []).append(next_index)
+    rollout["lastApprovedAt"] = cli.format_instant(at_instant)
+    promote_batch(rollout, next_index, at_instant)
+    append_event(rollout, EVENT_APPROVAL_GRANTED, at_instant, batch_index=next_index)
+    return batch_view(state, rollout, at_instant=at_instant)
 
 
 def cmd_batch_abort(state, args):
@@ -1607,6 +1690,12 @@ def batch_view(state, rollout, at_instant, reported_device=None, result=None,
         "rollbackDeadline": rollout.get("rollbackDeadline"),
         "targetDeviceIds": list(rollout["targetDeviceIds"]),
         "canaryDeviceIds": canary_ids,
+        # 人工放行门禁：是否开启、是否等待放行、approve 已打开的后续批次号与最近
+        # 放行时刻；旧状态缺字段时依次显示 false、false、[]、null，只读不补写。
+        "approvalRequired": bool(rollout.get("approvalRequired", False)),
+        "awaitingApproval": bool(rollout.get("awaitingApproval", False)),
+        "approvedBatchIndexes": list(rollout.get("approvedBatchIndexes") or []),
+        "lastApprovedAt": rollout.get("lastApprovedAt"),
         "status": rollout["status"],
         "frozen": rollout["frozen"],
         # 旧状态缺少暂停字段时按从未暂停读取：false / null / null。
@@ -2257,6 +2346,10 @@ def register_parsers(subparsers, add_state_option):
                               default=argparse.SUPPRESS,
                               help="金丝雀设备，可重复；须属于 target-device-id 集合、"
                                    "不重复且数量不超过 batch-size，按 device-id 升序进入第一批")
+    batch_create.add_argument("--approval-required", action="store_true",
+                              default=False,
+                              help="开启人工放行门禁：每批到达可推进边界且仍有下一批时"
+                                   "进入等待，须 batch approve 放行后才打开下一批")
     batch_create.set_defaults(handler=cmd_batch_create, mutating=True)
     add_state_option(batch_create)
 
@@ -2285,6 +2378,12 @@ def register_parsers(subparsers, add_state_option):
                               help="稳定观察秒数，大于等于 0 的整数；缺省保留原值")
     batch_update.add_argument("--rollback-timeout-seconds", default=None,
                               help="回滚收束时限（秒），大于等于 1 的整数；缺省保留原值")
+    batch_update.add_argument("--approval-required", action="store_true",
+                              default=False,
+                              help="开启人工放行门禁；不能与 --no-approval-required 同用")
+    batch_update.add_argument("--no-approval-required", action="store_true",
+                              default=False,
+                              help="关闭人工放行门禁；不能与 --approval-required 同用")
     batch_update.set_defaults(handler=cmd_batch_update, mutating=True)
     add_state_option(batch_update)
 
@@ -2332,6 +2431,14 @@ def register_parsers(subparsers, add_state_option):
     batch_resume.add_argument("--at", required=True, help="恢复时刻（ISO 8601）")
     batch_resume.set_defaults(handler=cmd_batch_resume, mutating=True)
     add_state_option(batch_resume)
+
+    batch_approve = batch_sub.add_parser(
+        "approve",
+        help="人工放行：批准等待中的批次打开下一批（仅 awaitingApproval 时生效）")
+    batch_approve.add_argument("--batch-id", required=True)
+    batch_approve.add_argument("--at", required=True, help="放行时刻（ISO 8601）")
+    batch_approve.set_defaults(handler=cmd_batch_approve, mutating=True)
+    add_state_option(batch_approve)
 
     batch_abort = batch_sub.add_parser("abort", help="人工止损：冻结后续批次并回滚已成功设备")
     batch_abort.add_argument("--batch-id", required=True)
