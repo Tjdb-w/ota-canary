@@ -14,7 +14,7 @@
 python -m ota_canary firmware register --version 2.0.0
 python -m ota_canary firmware list
 
-# 创建批次发布
+# 创建批次发布（--approval-required 开启人工放行门禁，缺省关闭）
 python -m ota_canary batch create \
     --batch-id B1 --target-version 2.0.0 --stable-version 1.0.0 \
     --batch-size 2 --failure-threshold 0.5 --heartbeat-timeout-seconds 900 \
@@ -63,6 +63,9 @@ python -m ota_canary batch rollback-retry --batch-id B1 \
     --device-id d1 --device-id d2 \
     --reason 网络恢复后重试 --at 2026-10-01T11:00:00Z
 
+# 人工放行：开启门禁的批次在可推进边界进入等待态，approve 打开下一批
+python -m ota_canary batch approve --batch-id B1 --at 2026-10-01T09:50:00Z
+
 # 只读状态查询
 python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 ```
@@ -100,11 +103,15 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 - 策略参数 `--batch-size`、`--failure-threshold`、`--heartbeat-timeout-seconds`、
   `--stabilization-seconds`、`--rollback-timeout-seconds` 缺省保留原值，
   提供时取值范围与 `batch create` 完全相同。
+- `--approval-required` / `--no-approval-required` 切换人工放行门禁（见
+  “人工放行门禁”节）；两开关同现返回 `InvalidArgument`，都未提供时保留原策略，
+  开关本身计为一项修改。
 - 目标替换后旧金丝雀不在新集合时，必须同时给出新金丝雀或
   `--clear-canary-device-ids`。
 - 校验与异常（全部通过后才一次写入，失败不改状态文件）：批次不存在 →
   `DeviceNotFound`；非 pending → `InvalidState`；设备参数空/重复、金丝雀与
-  清空选项同现、旧金丝雀脱离新目标、未提供任何修改项、新增显式目标含隔离
+  清空选项同现、两个放行门禁开关同现、旧金丝雀脱离新目标、未提供任何修改项、
+  新增显式目标含隔离
   设备 → `InvalidArgument`；未登记设备 → `DeviceNotFound`；空目标集合 →
   `EmptyDeviceSet`；金丝雀不属于
   目标或数量超过有效 `batch-size`、策略取值非法 → `InvalidBatchPolicy`。
@@ -177,6 +184,40 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   `rollback_timed_out` 事件。当前回滚记录全部 `success` 时批次收束为
   `rolled_back`，否则为 `rollback_failed` 并可再次 `rollback-retry`。
 
+## 人工放行门禁（approval-required / batch approve）
+
+- `batch create --approval-required` 开启可选人工放行门禁，缺省关闭（保留原自动
+  推进策略）。`batch update --approval-required` / `--no-approval-required` 可在
+  `pending` 阶段切换该开关；两开关同现返回 `InvalidArgument`，都未提供时保留
+  原策略。开关本身计为一项修改（单独提供即满足“至少一项调整”）。
+- 开启后 `batch start` 仍开始第一批。当前批集齐终态且未越失败阈值时，沿用
+  `stabilization-seconds` 与 `batch check --at` 的观察规则；到可推进边界（观察期
+  为 0 集齐即达，大于 0 须 `check --at` 严格晚于截止时刻）且仍有下一批时，
+  **不自动推进**：批次保持 `in_progress`、`awaitingApproval=true`，冻结尚未开始
+  设备，并以该时刻追加 `approval_requested` 事件（`batchIndex` 为下一批次号）。
+  末批没有下一批，直接 `completed`，不需要放行。
+- `batch approve --batch-id B1 --at <ISO 8601>` 仅在等待态生效：记录放行、
+  打开下一批并把合格未隔离设备置 `pending_upgrade`（放行时刻已被隔离的设备
+  保持 `queued`、不派发升级），登记 `approvedBatchIndexes`（0 起批次号，与
+  时间线 `batchIndex` 同口径）与 `lastApprovedAt`，追加 `approval_granted`
+  事件（`batchIndex` 为下一批次号）。批次、设备、状态与事件在一次命令内原子
+  更新，不改变升级、超时、回滚与占用的既有结果。
+- 等待期间：`batch check` 不推进（也不补超时——当前批已集齐终态）；`batch
+  pause` 可暂停，暂停后不能批准（`approve` 返回 `InvalidState`），`batch
+  resume` 恢复后回到等待态（不重复追加 `approval_requested`）；`batch abort`
+  按既有规则冻结并回滚（等待态随之结束）；迟到或冲突上报沿用既有幂等/拒绝
+  规则，后续批次设备仍被冻结，不能绕过门禁。
+- `batch status` 新增 `approvalRequired`（门禁是否开启）、`awaitingApproval`
+  （是否等待放行）、`approvedBatchIndexes`（`approve` 已打开的后续批次号）、
+  `lastApprovedAt`（最近一次放行时刻，UTC `Z`）；旧状态缺字段时依次显示
+  `false`、`false`、`[]`、`null`，只读不补写。`batch plan` 同样返回
+  `approvalRequired` 与 `awaitingApproval`（`pending` 预检时等待态恒为
+  `false`）。
+- 错误：批次不存在返回 `DeviceNotFound`；`--at` 非法返回 `InvalidArgument`；
+  非等待态（含未开启门禁、`pending`、`paused`、`failed_stopped`、已完成/已回滚）
+  执行 `approve` 返回 `InvalidState`。所有校验通过前不写任何状态：错误走
+  stderr JSON、非零退出且不修改状态文件；失败与重复动作不追加时间线事件。
+
 ## 稳定观察期（stabilization-seconds > 0）
 
 - 当前批设备全部取得终态后，先判失败率：失败率**严格大于** `failure-threshold`
@@ -199,7 +240,8 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 ## 启动前资格预检（batch plan，只读）
 
 - 对 `pending` 发布执行 `batch plan --batch-id B1 [--at 时间]` 做只读预检，
-  输出 `batchId`、`targetVersion`、`stableVersion`、`batchSize`、`targetDeviceIds`、
+  输出 `batchId`、`targetVersion`、`stableVersion`、`batchSize`、`approvalRequired`、
+  `awaitingApproval`、`targetDeviceIds`、
   `canaryDeviceIds`、`eligibleDeviceIds`、`ineligibleDevices`、`candidateCount`、`batches`。
 - `targetDeviceIds` 取创建时去重集合并按 device-id 升序；`canaryDeviceIds` 取创建时
   登记的金丝雀集合（升序），旧状态缺字段时显示 `[]`。
@@ -237,7 +279,9 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 - 所有回滚任务回报完毕：任一失败 → `rollback_failed`，全部成功 → `rolled_back`；
   没有需要回滚的设备时直接 `rolled_back`。未超阈值时：观察期为 0 立即推进下一批，
   全部完成 → `completed`；观察期大于 0 时先进入稳定观察期（见下节），
-  由 `batch check --at` 严格晚于截止时刻后推进或完成。
+  由 `batch check --at` 严格晚于截止时刻后推进或完成。开启人工放行门禁时，
+  到可推进边界且仍有下一批不自动推进，转为等待 `batch approve` 放行（见
+  “人工放行门禁”节）。
 - `batch abort` 是人工止损入口，接受 `in_progress`（含稳定观察期内）与 `paused`
   批次：立即冻结后续批次、拒绝新的升级报告，**成功时清空 `stabilizationDeadline`**，
   `stopReason` 固定为 `manual_abort`，并向**已成功**设备下发回滚到
@@ -336,6 +380,9 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 `retryDeviceIds`/`retryStartedAt`（最近一次回滚重试的设备集合与时刻，缺省
 `[]`/`null`）、`rollbackAttempts`（被重试取代的失败回滚尝试，依序保留
 `state`/`result`/`reason`/`heartbeatAt`/`version`，只增不覆盖，缺省 `[]`）、
+`approvalRequired`（人工放行门禁是否开启）、`awaitingApproval`（是否处于
+等待放行态）、`approvedBatchIndexes`（`approve` 已打开的后续批次号，0 起）、
+`lastApprovedAt`（最近一次放行时刻；旧状态依次显示 `false`/`false`/`[]`/`null`）、
 `phaseCounts`、
 回滚计数（`rollbackTotal/Pending/Succeeded/Failed`）与逐设备 `devices[]`。
 每条回滚记录含 `state`（`pending`/`success`/`failure`）、`heartbeatAt`、`version`
@@ -359,7 +406,7 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 ## 审计时间线（batch timeline，只读）
 
 `batch create`、`update`、`start`、`report`、`check`、`abort`、`rollback-report`、
-`rollback-retry`、`pause`、`resume` 成功后向批次追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态
+`rollback-retry`、`pause`、`resume`、`approve` 成功后向批次追加严格递增的审计事件；命令失败、幂等重复、冲突/迟到终态
 均不追加，历史事件只增不改。
 事件字段：`sequence`（从 1 起严格递增）、`type`、`occurredAt`、`batchIndex`、
 `deviceId`、`result`、`phaseFrom`、`phaseTo`、`reason`，未涉及的字段为 `null`。
@@ -367,6 +414,7 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 - `type` 取值：`created`、`policy_updated`、`started`、`batch_opened`、`upgrade_reported`、
   `timeout_recorded`、`batch_advanced`、`stopped`、`rollback_started`、
   `rollback_reported`、`rollback_timed_out`、`rollback_retry_started`、
+  `approval_requested`、`approval_granted`、
   `aborted`、`paused`、`resumed`、`finished`。
 - `occurredAt` 取显式 `--at`、调用时刻或心跳时刻，统一为 ISO 8601 UTC `Z` 后缀。
 - `batch check` 越过观察期截止时刻推进下一批时追加 `batch_advanced`，末批完成时
@@ -374,6 +422,10 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   超时结果的 `check` 不产生任何事件。
 - 自动停止事件 `stopped` 的 `reason=failure_threshold`；人工中止事件 `aborted`
   的 `reason` 为去除首尾空白后的 `--reason`。
+- 人工放行门禁：进入等待态时追加 `approval_requested`，`batch approve` 放行时
+  追加 `approval_granted`，`batchIndex` 均为下一批次号，`occurredAt` 取进入等待
+  的时刻（report/check/resume 路径）或 approve 的 `--at`；失败的 approve 与
+  重复动作不追加。
 
 ```bash
 python -m ota_canary batch timeline --batch-id B1 [--after-sequence N] [--limit M]
