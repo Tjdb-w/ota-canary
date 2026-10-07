@@ -20,6 +20,12 @@
 python -m ota_canary device add --device-id d1 --version 1.0.0 --heartbeat-at 2026-10-01T08:00:00Z
 python -m ota_canary device heartbeat --device-id d1 --version 1.0.0 --heartbeat-at 2026-10-01T09:00:00Z
 
+# 隔离故障设备 / 解除隔离（从后续放量候选中摘除 / 恢复候选资格）
+python -m ota_canary device quarantine --device-id d1 \
+    --reason "反复掉线" --at 2026-10-01T09:30:00Z
+python -m ota_canary device unquarantine --device-id d1 \
+    --reason "已更换硬件" --at 2026-10-02T08:00:00Z
+
 # 建立并启动发布
 python -m ota_canary release create --release-id R1 --version 2.0.0 \
     --previous-version 1.0.0 --batch-size 2 --max-failure-percent 50 \
@@ -94,6 +100,24 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
   状态为 `in_progress`/`paused` 的 release，以及状态为 `in_progress`/`paused`/
   `failed_stopped` 的 batch rollout，都持续占用其已经纳入批次的目标设备；
   `pending`、`completed`、`rolled_back`、`rollback_failed` 不占用。
+- `device quarantine` / `device unquarantine` 隔离与解除隔离故障设备，把故障设备从
+  后续放量中摘除：参数为 `--device-id`、`--reason`、`--at`，仅作用于已登记设备；
+  `--reason` 去除首尾空白后为 1 到 200 个 Unicode 字符，`--at` 沿用 ISO 8601 UTC
+  `Z` 口径。成功输出 `deviceId`、`active`、`reason`、`effectiveAt`、`history`：
+  `active` 表示当前隔离状态，`reason` 与 `effectiveAt` 对应最近一次动作，`history`
+  按调用先后追加 `action`（`quarantine`/`unquarantine`）、`reason`、`occurredAt`，
+  只增不改。设备不存在返回 `DeviceNotFound`；`reason` 或 `at` 非法返回
+  `InvalidArgument`；已隔离再隔离或未隔离就解除返回 `InvalidState`；失败写 stderr
+  JSON、非零退出且不改状态。隔离状态参与候选计算：`release start` 隐式候选按既有
+  规则排除隔离设备；`release plan`、`release start` 及 `release create`、
+  `release update` 的显式 target 遇到隔离设备返回 `InvalidArgument`；`batch plan`
+  将隔离设备标记为 `reason=quarantined`，`batch start` 仅推进合格设备（全部目标被
+  隔离时启动即 `completed`），`batch create`、`batch update` 新增显式 target 时
+  返回 `InvalidArgument`。隔离时已纳入批次的设备继续执行既有升级与回滚流程，不重算
+  批次、不触发额外回滚，既有响应不变；解除隔离只恢复后续候选资格，不补入 pending
+  发布。`fleet status` 每台设备新增 `quarantined`、`quarantineReason`、
+  `quarantineChangedAt`，旧状态依次显示 `false`、`null`、`null`；其余公开视图、
+  字段顺序和错误语义不变。
 - `release plan --release-id <id>` 是 pending 发布的只读分批预览，沿用 `--state`、
   `release create` 的目标集合与 `release start` 的候选/分批语义（同一套计算），但
   不创建批次、reports，不改设备版本、心跳、占用关系或状态文件，重复调用结果稳定。
@@ -178,7 +202,10 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
   默认 `900`，只接受大于等于 `1` 的整数，非法值或非法 `--at` 返回 `InvalidArgument`。
   成功输出顶层固定为 `at`、`heartbeatTimeoutSeconds`、`summary`、`devices`：
   `devices` 按 device-id 升序，每项为 `deviceId`、`version`、`heartbeatAt`、
-  `ageSeconds`、`heartbeatState`、`releaseId`、`report`。`ageSeconds` 为观察时刻减
+  `ageSeconds`、`heartbeatState`、`quarantined`、`quarantineReason`、
+  `quarantineChangedAt`、`releaseId`、`report`。`quarantined` 表示设备当前是否
+  被隔离，`quarantineReason` 与 `quarantineChangedAt` 对应最近一次隔离/解除
+  动作的原因与时刻，旧状态依次显示 `false`、`null`、`null`。`ageSeconds` 为观察时刻减
   `heartbeatAt` 的向下取整秒，心跳等于或晚于观察时刻时为 `0`，心跳缺失为 `null`；
   `heartbeatAt` 严格早于观察时刻减 timeout 时 `heartbeatState` 为 `stale`，否则
   `fresh`，心跳缺失为 `unknown`。指定 `--release-id` 时只列该发布批次设备，

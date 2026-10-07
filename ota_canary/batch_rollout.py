@@ -10,7 +10,9 @@
   仅当前版本等于 stableVersion 且未被跨子系统统一口径占用的设备合格——
   in_progress/paused 的 release，或其他 in_progress/paused/failed_stopped
   的 batch rollout 已纳入批次的设备均占用（release plan/start 使用同一口径）；
-  任一不合格即拒绝启动，全部合格时仅第一批置为 pending_upgrade；
+  版本/占用不合格即拒绝启动；隔离设备标记 reason=quarantined，不阻断启动，
+  仅从放量中摘除（batch start 仅推进合格设备，全部目标被隔离时启动即完成）；
+  合格设备放量时仅第一批置为 pending_upgrade；
 - ``batch create --canary-device-id``（可重复）指定金丝雀设备：须非空、不重复、
   属于同一命令的 target-device-id 且数量不超过 batch-size；金丝雀按 device-id
   升序进入第一批，非金丝雀按同序补足，其余目标按同序组成后续批次；未指定时
@@ -106,6 +108,8 @@ class InvalidBatchEligibility(cli.OtaError):
 # 启动前资格预检的不合格原因
 REASON_VERSION_MISMATCH = "VERSION_MISMATCH"
 REASON_DEVICE_BUSY = "DEVICE_BUSY"
+# 设备处于隔离状态：batch plan 标记该原因，batch start 跳过（仅推进合格设备）
+REASON_QUARANTINED = "quarantined"
 
 
 # 批次发布状态
@@ -432,9 +436,12 @@ def cmd_batch_create(state, args):
         getattr(args, "canary_device_id", None), device_ids, batch_size
     )
 
-    # 其余沿用既有入口约定：设备必须存在（金丝雀是目标子集，一并覆盖）
+    # 其余沿用既有入口约定：设备必须存在（金丝雀是目标子集，一并覆盖）；
+    # 显式目标不得包含隔离设备（InvalidArgument）。
     for device_id in device_ids:
         cli.get_device(state, device_id)
+        if cli.is_device_quarantined(state, device_id):
+            raise cli.InvalidArgument("target device %s is quarantined" % device_id)
 
     rollout = {
         "batchId": batch_id,
@@ -566,12 +573,18 @@ def cmd_batch_update(state, args):
     else:
         rollback_timeout = require_rollback_timeout(args.rollback_timeout_seconds)
 
-    # 目标替换：去重后的完整集合整体替换；每台设备必须已登记（DeviceNotFound）。
+    # 目标替换：去重后的完整集合整体替换；每台设备必须已登记（DeviceNotFound）
+    # 且未隔离（InvalidArgument）。未替换目标时不校验隔离（隔离时已纳入的
+    # 目标继续按既有流程处理）。
     if new_targets is None:
         new_targets = list(rollout["targetDeviceIds"])
     else:
         for device_id in new_targets:
             cli.get_device(state, device_id)
+            if cli.is_device_quarantined(state, device_id):
+                raise cli.InvalidArgument(
+                    "target device %s is quarantined" % device_id
+                )
 
     # 金丝雀解析：显式替换 > 清空 > 保留旧值。目标替换后旧金丝雀不在新集合
     # 且未给出新金丝雀或清空选项时拒绝（InvalidArgument）。
@@ -641,14 +654,15 @@ def evaluate_eligibility(state, rollout):
     - 当前版本等于 stableVersion 且未被跨子系统统一口径占用者合格：
       in_progress/paused 的 release 或 in_progress/paused/failed_stopped 的
       其他 batch rollout 已纳入批次的设备均占用；
-    - 版本不符与占用兼一时 VERSION_MISMATCH 优先；
+    - 隔离设备一律不合格（reason=quarantined），隔离判定优先于版本与占用；
+      版本不符与占用兼一时 VERSION_MISMATCH 优先；
     - batches 只含合格设备并按 batchSize 切分，无合格设备时为 []；
     - 金丝雀（创建时登记的 canaryDeviceIds）按 device-id 升序进入第一批，
       再用非金丝雀按同序补足，其余合格设备按同序组成后续批次；
       未指定金丝雀（含旧状态缺字段）时保持纯 device-id 升序切批。
     """
     target_ids = sorted(rollout["targetDeviceIds"])
-    # 显式目标先确认仍然存在（DeviceNotFound），再判版本与占用资格。
+    # 显式目标先确认仍然存在（DeviceNotFound），再判隔离、版本与占用资格。
     for device_id in target_ids:
         cli.get_device(state, device_id)
     stable_version = rollout["stableVersion"]
@@ -658,7 +672,9 @@ def evaluate_eligibility(state, rollout):
     for device_id in target_ids:
         device = state["devices"].get(device_id)
         version = device.get("version") if isinstance(device, dict) else None
-        if version != stable_version:
+        if cli.is_device_quarantined(state, device_id):
+            ineligible.append({"deviceId": device_id, "reason": REASON_QUARANTINED})
+        elif version != stable_version:
             ineligible.append({"deviceId": device_id, "reason": REASON_VERSION_MISMATCH})
         elif device_id in busy:
             ineligible.append({"deviceId": device_id, "reason": REASON_DEVICE_BUSY})
@@ -720,10 +736,12 @@ def cmd_batch_start(state, args):
         at_instant = datetime.now(timezone.utc)
     else:
         _, at_instant = cli.require_time(args.at)
-    # 与 plan 完全相同的资格、排序与分批口径：任一目标不合格即拒绝启动，
-    # 不创建批次或设备阶段，不发生任何状态写入。
+    # 与 plan 完全相同的资格、排序与分批口径：版本/占用不合格即拒绝启动，
+    # 不创建批次或设备阶段，不发生任何状态写入；隔离设备（reason=quarantined）
+    # 不阻断启动，仅从放量中摘除——仅推进合格设备。
     ids, eligible_ids, ineligible, planned_batches = evaluate_eligibility(state, rollout)
-    if ineligible:
+    blocking = [item for item in ineligible if item["reason"] != REASON_QUARANTINED]
+    if blocking:
         raise InvalidBatchEligibility(ineligible_message(ineligible))
     rollout["batches"] = planned_batches
     entries = rollout["devices"]
@@ -737,11 +755,20 @@ def cmd_batch_start(state, args):
                 "terminal": None,
                 "rollback": None,
             }
-    rollout["status"] = STATUS_IN_PROGRESS
-    promote_batch(rollout, 0, at_instant)
-    append_event(rollout, EVENT_STARTED, at_instant,
-                 phase_from=STATUS_PENDING, phase_to=STATUS_IN_PROGRESS)
-    append_event(rollout, EVENT_BATCH_OPENED, at_instant, batch_index=0)
+    if rollout["batches"]:
+        rollout["status"] = STATUS_IN_PROGRESS
+        promote_batch(rollout, 0, at_instant)
+        append_event(rollout, EVENT_STARTED, at_instant,
+                     phase_from=STATUS_PENDING, phase_to=STATUS_IN_PROGRESS)
+        append_event(rollout, EVENT_BATCH_OPENED, at_instant, batch_index=0)
+    else:
+        # 目标设备均被隔离：无合格设备可推进，启动后直接 completed（名义生命周期
+        # 与 release start 空匹配一致：pending→in_progress→completed）。
+        rollout["status"] = STATUS_COMPLETED
+        append_event(rollout, EVENT_STARTED, at_instant,
+                     phase_from=STATUS_PENDING, phase_to=STATUS_IN_PROGRESS)
+        append_event(rollout, EVENT_FINISHED, at_instant,
+                     phase_from=STATUS_IN_PROGRESS, phase_to=STATUS_COMPLETED)
     mark_status_changed(rollout, at_instant)
     return batch_view(state, rollout, at_instant=at_instant)
 

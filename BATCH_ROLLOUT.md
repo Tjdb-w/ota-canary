@@ -80,7 +80,8 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
    `rollback-timeout-seconds` 非整数或小于 1、金丝雀数量超过 `batch-size`
    → `InvalidBatchPolicy`
 5. 版本号格式非法、设备 ID 空/重复、金丝雀为空/重复/不属于目标集合、
-   设备未登记等参数问题沿用既有 `InvalidArgument` 与 `DeviceNotFound`。
+   设备未登记等参数问题沿用既有 `InvalidArgument` 与 `DeviceNotFound`；
+   显式目标含隔离设备 → `InvalidArgument`。
 
 `batch create --stabilization-seconds` 为可选参数，取大于等于 0 的整数，缺省 `0`，
 与 `release create` 的同名参数互不影响；为 `0` 时保持既有推进时机（集齐终态即推进）。
@@ -103,8 +104,9 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   `--clear-canary-device-ids`。
 - 校验与异常（全部通过后才一次写入，失败不改状态文件）：批次不存在 →
   `DeviceNotFound`；非 pending → `InvalidState`；设备参数空/重复、金丝雀与
-  清空选项同现、旧金丝雀脱离新目标、未提供任何修改项 → `InvalidArgument`；
-  未登记设备 → `DeviceNotFound`；空目标集合 → `EmptyDeviceSet`；金丝雀不属于
+  清空选项同现、旧金丝雀脱离新目标、未提供任何修改项、新增显式目标含隔离
+  设备 → `InvalidArgument`；未登记设备 → `DeviceNotFound`；空目标集合 →
+  `EmptyDeviceSet`；金丝雀不属于
   目标或数量超过有效 `batch-size`、策略取值非法 → `InvalidBatchPolicy`。
 - 成功后保持 `pending`，不建批次、不改设备或占用，按 `--at` 的 UTC `Z` 时刻
   追加 `policy_updated` 审计事件，并输出与 `batch status` 同口径的视图；
@@ -207,8 +209,8 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
   使用同一口径）；`completed`、`rolled_back`、`rollback_failed` 释放占用，`pending`
   发布尚未建批也不占用。占用只统计已纳入批次（`batches`）的设备，未纳入批次的目标不占用。
 - `ineligibleDevices` 按 device-id 升序给出 `{deviceId, reason}`，每台设备唯一原因：
-  版本不符为 `VERSION_MISMATCH`，被占用为 `DEVICE_BUSY`；两者兼有时
-  `VERSION_MISMATCH` 优先。
+  版本不符为 `VERSION_MISMATCH`，被占用为 `DEVICE_BUSY`，被隔离为 `quarantined`；
+  隔离判定优先，版本不符与占用兼有时 `VERSION_MISMATCH` 优先。
 - `batches` 只含合格设备并按 `batchSize` 切分；没有合格设备时为 `[]`。
   指定金丝雀时合格的金丝雀按 device-id 升序进入第一批，非金丝雀按同序补足。
 - `plan` 只读、不创建批次或设备阶段、不改设备版本/心跳/占用，重复调用结果一致；
@@ -218,10 +220,12 @@ python -m ota_canary batch status --batch-id B1 [--at 2026-10-01T10:00:00Z]
 
 ## 推进与停止
 
-- `batch start` 使用与 `plan` 完全相同的资格、排序与分批口径：任一目标设备不合格时
-  非零退出，stderr JSON 返回 `InvalidBatchEligibility`，消息按 device-id 升序列出
-  `设备=VERSION_MISMATCH|DEVICE_BUSY`，且**不启动、不创建批次或设备阶段、不落盘**。
-- 全部合格时才启动：第一批设备置为 `pending_upgrade`，其余批次保持 `queued`。
+- `batch start` 使用与 `plan` 完全相同的资格、排序与分批口径：任一目标设备因版本
+  或占用不合格时非零退出，stderr JSON 返回 `InvalidBatchEligibility`，消息按
+  device-id 升序列出 `设备=VERSION_MISMATCH|DEVICE_BUSY`，且**不启动、不创建批次
+  或设备阶段、不落盘**。隔离设备（`quarantined`）不阻断启动，仅从放量中摘除：
+  `batch start` 仅推进合格设备，全部目标被隔离时启动即 `completed`（不再建批）。
+- 有合格设备时才开批：第一批设备置为 `pending_upgrade`，其余批次保持 `queued`。
 - `start` 对不存在发布、非 `pending`、非法 `--at` 沿用 `plan` 的同一错误。
 - 启动后每次只把**下一批**设备置为 `pending_upgrade`，其余批次保持 `queued`。
 - 设备成功后记录目标版本；终态 `failure`，或等待终态期间超过心跳超时仍无有效心跳
