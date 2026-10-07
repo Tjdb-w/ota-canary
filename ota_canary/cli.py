@@ -260,6 +260,83 @@ def require_abort_reason(value):
 
 
 # ---------------------------------------------------------------------------
+# 设备隔离（quarantine）：把故障设备从后续放量候选中摘除
+# ---------------------------------------------------------------------------
+
+QUARANTINE_ACTION_QUARANTINE = "quarantine"
+QUARANTINE_ACTION_UNQUARANTINE = "unquarantine"
+
+
+def is_device_quarantined(device):
+    """设备当前是否处于隔离状态；旧状态缺隔离记录按未隔离读取（只读，不回填）。"""
+    if not isinstance(device, dict):
+        return False
+    record = device.get("quarantine")
+    return bool(isinstance(record, dict) and record.get("active"))
+
+
+def quarantine_view(device_id, device):
+    """隔离状态视图：deviceId/active/reason/effectiveAt/history，只读不回填。
+
+    active 表示当前是否隔离；reason 与 effectiveAt 对应最近一次动作（隔离或
+    解除隔离）；history 按调用先后追加 action/reason/occurredAt，只增不改。
+    旧状态缺隔离记录时显示 active=false、reason=null、effectiveAt=null、
+    history=[]，查询与失败命令均不补写。
+    """
+    record = device.get("quarantine") if isinstance(device, dict) else None
+    if not isinstance(record, dict):
+        record = {}
+    history = record.get("history")
+    if not isinstance(history, list):
+        history = []
+    return {
+        "deviceId": device_id,
+        "active": bool(record.get("active")),
+        "reason": record.get("reason"),
+        "effectiveAt": record.get("effectiveAt"),
+        "history": [
+            {
+                "action": entry.get("action"),
+                "reason": entry.get("reason"),
+                "occurredAt": entry.get("occurredAt"),
+            }
+            for entry in history
+            if isinstance(entry, dict)
+        ],
+    }
+
+
+def apply_quarantine_action(device, action, reason, at_instant):
+    """写入一次隔离/解除隔离动作；仅在全部校验通过后的成功路径调用。"""
+    record = device.get("quarantine")
+    if not isinstance(record, dict):
+        record = {"active": False, "reason": None, "effectiveAt": None, "history": []}
+        device["quarantine"] = record
+    history = record.get("history")
+    if not isinstance(history, list):
+        history = []
+        record["history"] = history
+    occurred_at = format_instant(at_instant)
+    record["active"] = action == QUARANTINE_ACTION_QUARANTINE
+    record["reason"] = reason
+    record["effectiveAt"] = occurred_at
+    history.append({"action": action, "reason": reason, "occurredAt": occurred_at})
+
+
+def fleet_quarantine_fields(record):
+    """fleet status 的隔离展示字段；旧状态缺记录时依次显示 false/null/null。"""
+    quarantine = record.get("quarantine") if isinstance(record, dict) else None
+    if not isinstance(quarantine, dict):
+        return {"quarantined": False, "quarantineReason": None,
+                "quarantineChangedAt": None}
+    return {
+        "quarantined": bool(quarantine.get("active")),
+        "quarantineReason": quarantine.get("reason"),
+        "quarantineChangedAt": quarantine.get("effectiveAt"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 状态读写
 # ---------------------------------------------------------------------------
 
@@ -421,6 +498,34 @@ def cmd_device_heartbeat(state, args):
     return dict(device)
 
 
+def cmd_device_quarantine(state, args):
+    """隔离已登记设备：从后续放量候选中摘除；已纳入批次的设备不受影响。
+
+    设备不存在 DeviceNotFound；reason（去除首尾空白后 1 到 200 个字符）或 at
+    非法 InvalidArgument；已隔离再隔离 InvalidState。失败不写任何状态。
+    """
+    device_id = require_id(args.device_id, "device-id")
+    reason = require_abort_reason(args.reason)
+    _, at_instant = require_time(args.at)
+    device = get_device(state, device_id)
+    if is_device_quarantined(device):
+        raise InvalidState("device %s is already quarantined" % device_id)
+    apply_quarantine_action(device, QUARANTINE_ACTION_QUARANTINE, reason, at_instant)
+    return quarantine_view(device_id, device)
+
+
+def cmd_device_unquarantine(state, args):
+    """解除隔离：仅恢复后续候选资格，不补入 pending 发布；未隔离就解除 InvalidState。"""
+    device_id = require_id(args.device_id, "device-id")
+    reason = require_abort_reason(args.reason)
+    _, at_instant = require_time(args.at)
+    device = get_device(state, device_id)
+    if not is_device_quarantined(device):
+        raise InvalidState("device %s is not quarantined" % device_id)
+    apply_quarantine_action(device, QUARANTINE_ACTION_UNQUARANTINE, reason, at_instant)
+    return quarantine_view(device_id, device)
+
+
 def cmd_release_create(state, args):
     release_id = require_id(args.release_id, "release-id")
     version = require_version(args.version)
@@ -437,6 +542,13 @@ def cmd_release_create(state, args):
     target_device_ids = require_target_device_ids(args.target_device_id)
     if release_id in state["releases"]:
         raise DeviceExists("release already exists: %s" % release_id)
+    # 显式目标不得包含隔离设备（InvalidArgument）；未登记设备的存在性仍由
+    # 后续 plan/start 判定，此处不校验。
+    if target_device_ids is not None:
+        for device_id in target_device_ids:
+            device = state["devices"].get(device_id)
+            if device is not None and is_device_quarantined(device):
+                raise InvalidArgument("target device %s is quarantined" % device_id)
     release = {
         "releaseId": release_id,
         "version": version,
@@ -467,16 +579,17 @@ def compute_release_candidates(state, release):
     """按 release start 的口径只读计算候选设备。
 
     返回 (targetDeviceIds, eligible)：targetDeviceIds 为 None 表示未指定定向；
-    显式目标先校验全部存在（DeviceNotFound），再按原顺序校验版本与占用
+    显式目标先校验全部存在（DeviceNotFound），再按原顺序校验版本、占用与隔离
     （InvalidArgument）。占用按跨子系统统一口径（unified_occupied_device_ids）：
     in_progress/paused 的 release 与 in_progress/paused/failed_stopped 的
-    batch rollout 已纳入批次的设备均占用。
+    batch rollout 已纳入批次的设备均占用；隔离设备在隐式候选中按既有规则排除、
+    在显式目标中报 InvalidArgument。
     eligible 已按 device-id 升序（显式目标集合在 create 时已排序）。
     """
     target_device_ids = release.get("targetDeviceIds")
     occupied = unified_occupied_device_ids(state)
     if target_device_ids is not None:
-        # 显式目标：先确认全部存在（DeviceNotFound），再确认版本与占用（InvalidArgument）。
+        # 显式目标：先确认全部存在（DeviceNotFound），再确认版本、占用与隔离（InvalidArgument）。
         for device_id in target_device_ids:
             if device_id not in state["devices"]:
                 raise DeviceNotFound("target device not found: %s" % device_id)
@@ -493,11 +606,15 @@ def compute_release_candidates(state, release):
                     "release, or an in_progress, paused or failed_stopped batch rollout"
                     % device_id
                 )
+            if is_device_quarantined(device):
+                raise InvalidArgument("target device %s is quarantined" % device_id)
         return target_device_ids, list(target_device_ids)
     eligible = sorted(
         device_id
         for device_id, device in state["devices"].items()
-        if device.get("version") == release["previousVersion"] and device_id not in occupied
+        if device.get("version") == release["previousVersion"]
+        and device_id not in occupied
+        and not is_device_quarantined(device)
     )
     return target_device_ids, eligible
 
@@ -585,11 +702,13 @@ def cmd_release_update(state, args):
     if args.batch_size is None and new_targets is None and not clear_targets:
         raise InvalidArgument("release update requires at least one change")
 
-    # 显式目标整体替换：每台设备必须已登记（DeviceNotFound）；版本与占用由
-    # 后续 plan/start 判定，此处不校验。
+    # 显式目标整体替换：每台设备必须已登记（DeviceNotFound）且未隔离
+    # （InvalidArgument）；版本与占用由后续 plan/start 判定，此处不校验。
     if new_targets is not None:
         for device_id in new_targets:
-            get_device(state, device_id)
+            device = get_device(state, device_id)
+            if is_device_quarantined(device):
+                raise InvalidArgument("target device %s is quarantined" % device_id)
 
     # 全部校验通过，一次写入并追加事件；省略项保持原值（旧状态缺 targetDeviceIds
     # 且未调整目标时不回填）。
@@ -1113,6 +1232,7 @@ def cmd_fleet_status(state, args):
             row = fleet_device_row(device_id, record, at_instant, stale_boundary)
             row["releaseId"] = release_id_arg
             row["report"] = reports.get(device_id)
+            row.update(fleet_quarantine_fields(record))
             rows.append(row)
     else:
         # 扫描 in_progress/paused 发布的占用关系；正常状态下设备不会被多个活动发布占用，
@@ -1139,6 +1259,7 @@ def cmd_fleet_status(state, args):
             owner = occupancy.get(device_id)
             row["releaseId"] = owner
             row["report"] = None
+            row.update(fleet_quarantine_fields(record))
             rows.append(row)
 
     summary = {
@@ -1329,6 +1450,24 @@ def build_parser():
     device_report.add_argument("--heartbeat-at", required=True)
     device_report.set_defaults(handler=cmd_device_report, mutating=True)
     add_state_option(device_report)
+
+    device_quarantine = device_sub.add_parser(
+        "quarantine", help="隔离故障设备，从后续放量候选中摘除")
+    device_quarantine.add_argument("--device-id", required=True)
+    device_quarantine.add_argument("--reason", required=True,
+                                   help="隔离原因，去除首尾空白后 1 到 200 个 Unicode 字符")
+    device_quarantine.add_argument("--at", required=True, help="生效时刻（ISO 8601）")
+    device_quarantine.set_defaults(handler=cmd_device_quarantine, mutating=True)
+    add_state_option(device_quarantine)
+
+    device_unquarantine = device_sub.add_parser(
+        "unquarantine", help="解除设备隔离，恢复后续放量候选资格")
+    device_unquarantine.add_argument("--device-id", required=True)
+    device_unquarantine.add_argument("--reason", required=True,
+                                     help="解除原因，去除首尾空白后 1 到 200 个 Unicode 字符")
+    device_unquarantine.add_argument("--at", required=True, help="生效时刻（ISO 8601）")
+    device_unquarantine.set_defaults(handler=cmd_device_unquarantine, mutating=True)
+    add_state_option(device_unquarantine)
 
     device_timeline = device_sub.add_parser(
         "timeline", help="查询设备跨 release 与 batch rollout 的升级时间线（只读）")

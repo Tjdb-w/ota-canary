@@ -39,6 +39,12 @@ python -m ota_canary release update --release-id R1 [--batch-size 3] \
 python -m ota_canary device report --release-id R1 --device-id d1 \
     --result success --heartbeat-at 2026-10-01T10:00:00Z
 
+# 隔离故障设备 / 解除隔离（从后续放量候选中摘除）
+python -m ota_canary device quarantine --device-id d1 \
+    --reason "频繁掉线" --at 2026-10-01T10:00:00Z
+python -m ota_canary device unquarantine --device-id d1 \
+    --reason "已修复" --at 2026-10-02T10:00:00Z
+
 # 按给定时刻收批心跳超时设备（仅处理 in_progress 发布）
 python -m ota_canary release check --release-id R1 --at 2026-10-01T10:00:00Z
 
@@ -76,6 +82,22 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
 行为约定：
 
 - 版本号格式为 `MAJOR.MINOR.PATCH`，时间为 ISO 8601（支持 `Z` 后缀，无偏移按 UTC）。
+- `device quarantine` / `device unquarantine` 隔离与解除隔离已登记设备：参数为
+  `--device-id`、`--reason`（去除首尾空白后 1 到 200 个 Unicode 字符）与 `--at`
+  （ISO 8601）。输出 `deviceId`、`active`、`reason`、`effectiveAt`、`history`：
+  `active` 表示当前是否隔离，`reason` 与 `effectiveAt` 对应最近一次动作，
+  `history` 按调用先后追加 `action`/`reason`/`occurredAt`；旧状态显示
+  `active=false`、`history=[]`，查询与失败不补写。设备不存在返回
+  `DeviceNotFound`，`reason` 或 `at` 非法返回 `InvalidArgument`，已隔离再隔离
+  或未隔离就解除返回 `InvalidState`；失败写 stderr JSON、非零退出且不改状态。
+  隔离状态参与候选计算：`release start` 隐式候选排除隔离设备；`release plan`、
+  `release start` 及 `release create`、`release update` 的显式目标遇到隔离设备
+  返回 `InvalidArgument`；`batch plan` 标记 `reason=quarantined`，`batch start`
+  仅推进合格设备，`batch create`、`batch update` 新增显式目标含隔离设备时返回
+  `InvalidArgument`。隔离时已纳入批次的设备继续执行既有升级与回滚流程，不重算
+  批次；解除隔离只恢复后续候选资格，不补入 pending 发布。`fleet status` 每行
+  增加 `quarantined`、`quarantineReason`、`quarantineChangedAt`，旧状态依次显示
+  `false`、`null`、`null`。
 - `release create` 可选 `--heartbeat-timeout-seconds`，为大于等于 1 的整数，缺省 `900`；
   发布视图含 `heartbeatTimeoutSeconds`，缺少该字段的旧发布按 `900` 计。
 - `release create` 可选 `--stabilization-seconds`，为大于等于 0 的整数，缺省 `0`；
@@ -178,7 +200,8 @@ python -m ota_canary fleet check --at 2026-10-01T10:00:00Z
   默认 `900`，只接受大于等于 `1` 的整数，非法值或非法 `--at` 返回 `InvalidArgument`。
   成功输出顶层固定为 `at`、`heartbeatTimeoutSeconds`、`summary`、`devices`：
   `devices` 按 device-id 升序，每项为 `deviceId`、`version`、`heartbeatAt`、
-  `ageSeconds`、`heartbeatState`、`releaseId`、`report`。`ageSeconds` 为观察时刻减
+  `ageSeconds`、`heartbeatState`、`releaseId`、`report`、`quarantined`、
+  `quarantineReason`、`quarantineChangedAt`。`ageSeconds` 为观察时刻减
   `heartbeatAt` 的向下取整秒，心跳等于或晚于观察时刻时为 `0`，心跳缺失为 `null`；
   `heartbeatAt` 严格早于观察时刻减 timeout 时 `heartbeatState` 为 `stale`，否则
   `fresh`，心跳缺失为 `unknown`。指定 `--release-id` 时只列该发布批次设备，
